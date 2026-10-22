@@ -1,6 +1,6 @@
 script_name('AMARAYTHEN Capter')
 script_author('amaru')
-script_version('2.2')
+script_version('2.3')
 script_description('AMARAYTHEN Capter by amaru: синхронный флуд /capture волной. Запуск лидером через /fc.')
 -- Совместимость с автообновлением v1.8-v1.9, которые ищут в новом файле прежнее имя.
 -- Не удалять: script_name('SF Capture')
@@ -26,13 +26,14 @@ end
 
 -- ============================ НАСТРОЙКИ ============================
 local CFG = {
-    -- Общий список: ростер и лидеры.
-    roster_url      = 'https://raw.githubusercontent.com/amaru1918/sf-roster/main/sf_roster.txt',
-    roster_refresh  = 120,        -- как часто перепроверять список, с (когда нет флуда)
+    -- Репозиторий, где лежат общий список (ростер и лидеры) и сам скрипт для автообновления.
+    github          = { owner = 'amaru1918', repo = 'sf-roster', branch = 'main' },
+    roster_path     = 'sf_roster.txt',
+    script_path     = 'sf_capture.lua',
+    roster_refresh  = 180,        -- как часто перепроверять список, с (когда нет флуда)
+    sync_cooldown   = 5,          -- не чаще раза в N секунд выполнять «обновить у всех»
     -- Лидеры, пока общий список ещё ни разу не скачан или в нём нет секции [leaders].
     default_leaders = { 'Escay_Eastwood' },
-    -- Автообновление: отсюда скачивается новая версия скрипта.
-    update_url      = 'https://raw.githubusercontent.com/amaru1918/sf-roster/main/sf_capture.lua',
     auto_update     = true,
     update_interval = 1800,       -- как часто проверять обновления, с
 
@@ -64,12 +65,16 @@ local CFG = {
 }
 -- ==================================================================
 
+-- Прямая ссылка на список (по ней же подписана сохранённая копия списка у игрока)
+CFG.roster_url = string.format('https://raw.githubusercontent.com/%s/%s/%s/%s',
+    CFG.github.owner, CFG.github.repo, CFG.github.branch, CFG.roster_path)
+
 local TAG       = '{C9A227}[AMARAYTHEN]{CFCFCF} '
 local TAG_COLOR = 0xC9A227
 
 -- Общий список. leaders = nil, если в нём нет секции [leaders].
--- Версия 0 - список ещё ни разу не скачивался.
-local roster = { version = 0, list = {}, leaders = nil }
+-- Версия 0 - список ещё ни разу не скачивался. fetchedAt - когда последний раз скачан.
+local roster = { version = 0, list = {}, leaders = nil, fetchedAt = nil }
 
 local state = {
     phase     = 'idle',   -- idle | countdown | running
@@ -158,6 +163,29 @@ local function isLeader(nick)
     return false
 end
 
+-- «Отпечаток» списка: короткая строка, которая меняется при любой правке ников или лидеров.
+-- Лидер отправляет её в коде запуска, и каждый сразу видит, совпадает ли его список.
+local B36 = '0123456789abcdefghijklmnopqrstuvwxyz'
+
+local function listHash()
+    local s = lower(table.concat(leaderList(), ',') .. '|' .. table.concat(roster.list, ','))
+    local h = 7
+    for i = 1, #s do h = (h * 31 + s:byte(i)) % 2147483647 end
+    local out = ''
+    repeat
+        local r = h % 36
+        out = B36:sub(r + 1, r + 1) .. out
+        h = math.floor(h / 36)
+    until h == 0
+    return out
+end
+
+-- Совпадает ли мой список с лидерским (по отпечатку, а у старых версий - по номеру)
+local function listMatches(ver, hash)
+    if hash and hash ~= '' then return hash == listHash() end
+    return ver == roster.version
+end
+
 -- Позиция ника в строке как отдельного слова (обе строки уже через norm)
 local function findWord(hay, needle)
     local init = 1
@@ -219,18 +247,9 @@ end
 local loadRemoteRoster  -- объявлены ниже, в разделе "ростер"
 local applyCachedRoster
 
--- codeAt - когда пришёл код запуска (если подключаемся с опозданием после обновления ростера)
-local function beginCountdown(leader, delay, cd, ver, codeAt)
-    if ver ~= roster.version then
-        if ver < roster.version then
-            msg(string.format('{FF6060}У лидера устаревший список (v%d, у тебя v%d) - пусть наберёт /ac reload.',
-                ver, roster.version))
-        else
-            msg(string.format('{FF6060}Список не совпадает: у лидера v%d, у тебя v%d. Набери /ac reload.',
-                ver, roster.version))
-        end
-        return
-    end
+-- codeAt - когда пришёл код запуска (если подключаемся с опозданием после обновления списка).
+-- Совпадение списков проверяется до вызова.
+local function beginCountdown(leader, delay, cd, codeAt)
     local slot, active = computeSlot()
     if not slot then
         msg('Тебя нет в списке, в этом запуске не участвуешь.')
@@ -308,6 +327,8 @@ local function processOutbox(now)
             if kind == 'GO' then
                 msg('{FF6060}Код не вернулся из ' .. CFG.chat_cmd ..
                     ' или не распознан. Включи /ac debug и повтори запуск.')
+            elseif kind == 'SYNC' then
+                msg('{FF6060}Команда обновления не прошла в ' .. CFG.chat_cmd .. '. Повтори /ac sync.')
             else
                 msg('{FF6060}Стоп не прошёл в ' .. CFG.chat_cmd ..
                     '. Повтори /ac stop, иначе остальные остановятся по автостопу.')
@@ -317,29 +338,35 @@ local function processOutbox(now)
 end
 
 -- Разбор служебного кода. Возвращает true, если код распознан (тогда строка скрывается).
--- Формат: "#SF GO <задержка> <отсчёт> <версия ростера>" и "#SF STOP" - без двоеточий,
--- чтобы антиреклама сервера не приняла цифры за IP:порт.
--- Код запуска с более новой версией общего ростера: скачиваем список прямо сейчас.
--- Лидер ли отправитель, решает уже новый список (так подхватываются и новые лидеры),
+-- Форматы (без двоеточий, чтобы антиреклама сервера не приняла цифры за IP:порт):
+--   #SF GO <задержка> <отсчёт> <версия списка> <отпечаток списка>
+--   #SF STOP
+--   #SF SYNC  - лидер просит всех обновить список
+-- Старые версии скрипта не знают про отпечаток и просто его не читают.
+
+-- Мой список отличается от лидерского: скачиваем свежий прямо во время отсчёта.
+-- Лидер ли отправитель, решает уже свежий список (так подхватываются и новые лидеры),
 -- а к волне подключаемся с учётом времени, ушедшего на загрузку.
 local lastForeignCatchUp = -100
+local lastSyncAt = -100
 
-local function catchUpAndStart(sender, delay, cd, ver)
+local function catchUpAndStart(sender, delay, cd, ver, hash)
     local receivedAt = os.clock()
     if isLeader(sender) then
-        msg(string.format('У лидера список новее (v%d, у тебя v%d), обновляю...', ver, roster.version))
+        msg('Твой список отличается от лидерского, обновляю...')
     else
-        dbg(string.format('код от %s с версией v%d, проверяю общий список', sender, ver))
+        dbg(string.format('код от %s, его нет в моём списке лидеров - проверяю общий список', sender))
     end
     loadRemoteRoster(false, function()
         if not isLeader(sender) then
             dbg('после обновления списка ' .. sender .. ' всё равно не лидер - игнор')
-        elseif roster.version ~= ver then
-            msg(string.format('{FF6060}Не удалось получить список v%d, в этом запуске не участвуешь.', ver))
+        elseif not listMatches(ver, hash) then
+            msg('{FF6060}Список у тебя и у лидера всё равно разный - в этом запуске не участвуешь. ' ..
+                'Лидеру: /ac sync и запуск заново.')
         elseif state.lastStopAt >= receivedAt then
             msg('Пока обновлялся список, лидер уже остановил запуск.')
         elseif state.phase == 'idle' then
-            beginCountdown(sender, delay, cd, ver, receivedAt)
+            beginCountdown(sender, delay, cd, receivedAt)
         end
     end)
 end
@@ -357,32 +384,38 @@ local function handleCode(clean, codePos)
     local me = myNick()
     local fromMe = me and norm(me) == norm(sender)
 
-    local d, cd, ver = rest:match('^%s+GO%s+(%d+)%s+(%d+)%s+(%d+)')
+    local d, cd, ver, hash = rest:match('^%s+GO%s+(%d+)%s+(%d+)%s+(%d+)%s*(%w*)')
     if d then
         d, cd, ver = tonumber(d), tonumber(cd), tonumber(ver)
-        if ver > roster.version then
-            -- не лидер по моему списку - обновляемся не чаще раза в 10 с, чтобы нельзя было
-            -- заставить всех постоянно качать список
-            if not isLeader(sender) then
+        local leader = isLeader(sender)
+        if not listMatches(ver, hash) or not leader then
+            -- код от того, кого нет в моём списке лидеров: возможно, мой список устарел.
+            -- Таких проверяем не чаще раза в 10 с, чтобы нельзя было заставить всех качать список.
+            if not leader then
                 if os.clock() - lastForeignCatchUp < 10 then return false end
                 lastForeignCatchUp = os.clock()
             end
             if fromMe then confirmOutbox('GO') end
-            catchUpAndStart(sender, d, cd, ver)
+            catchUpAndStart(sender, d, cd, ver, hash)
             return true
         end
-        if not isLeader(sender) then
-            dbg('код от ' .. sender .. ', он не в списке лидеров - игнор')
-            return false
-        end
         if fromMe then confirmOutbox('GO') end
-        beginCountdown(sender, d, cd, ver)
+        beginCountdown(sender, d, cd)
         return true
     end
 
     if not isLeader(sender) then
         dbg('код от ' .. sender .. ', он не в списке лидеров - игнор')
         return false
+    end
+    if rest:match('^%s+SYNC') then
+        if fromMe then confirmOutbox('SYNC') end
+        if os.clock() - lastSyncAt >= CFG.sync_cooldown then
+            lastSyncAt = os.clock()
+            msg(fromMe and 'Обновляю список у всех...' or ('Лидер ' .. sender .. ' обновляет список у всех...'))
+            loadRemoteRoster(true)
+        end
+        return true
     end
     if rest:match('^%s+STOP') then
         if fromMe then
@@ -589,70 +622,139 @@ local function saveRosterCache(content)
     f:close()
 end
 
--- Raw-ссылка Gist с хешем правки (/raw/<40 символов>/) всегда отдаёт ту старую версию.
--- Убираем хеш, чтобы ссылка вела на последнюю правку, и добавляем метку против кэша.
-local function rosterDownloadUrl(url)
-    url = url:gsub('(/raw/)' .. string.rep('%x', 40) .. '/', '%1')
-    return url .. (url:find('?', 1, true) and '&' or '?') .. 'nocache=' .. os.time()
-end
+-- ---------------------- скачивание с GitHub ------------------------
+-- Прямые ссылки raw.githubusercontent.com GitHub кэширует до 5 минут, поэтому файлы берутся
+-- через API GitHub: он отдаёт свежую версию сразу. Если API не ответил (например, исчерпан
+-- лимит запросов), файл берётся по прямой ссылке.
 
-local rosterRequest   = 0
-local rosterLoading   = false
-local rosterCheckedAt = -1000
+local httpSeq = 0
 
--- verbose - писать в чат и об успехе, и об ошибках (иначе - только если список изменился).
--- onDone(ok) вызывается по завершении, timeoutMs - сколько ждать ответа.
-loadRemoteRoster = function(verbose, onDone, timeoutMs)
+-- Скачивает url, вызывает cb(содержимое) или cb(nil) при ошибке или по таймауту
+local function httpGet(url, timeoutMs, cb)
+    httpSeq = httpSeq + 1
     local dir = getWorkingDirectory() .. '\\config'
     if not doesDirectoryExist(dir) then createDirectory(dir) end
-    local path = dir .. '\\sf_roster.txt'
+    local path = string.format('%s\\sf_download_%d.tmp', dir, httpSeq)
     os.remove(path)
-
-    rosterRequest = rosterRequest + 1
-    rosterLoading = true
-    rosterCheckedAt = os.clock()
-    local request, done = rosterRequest, false
-    local function finish(ok, text)
+    local done = false
+    local function finish(content)
+        if done then return end
         done = true
-        rosterLoading = false
-        if text then msg(text) end
-        if onDone then onDone(ok) end
+        os.remove(path)
+        cb(content)
     end
-
-    local url = rosterDownloadUrl(CFG.roster_url)
-    dbg('скачиваю список: ' .. url)
     downloadUrlToFile(url, path, function(id, status)
-        if status ~= dlstatus.STATUS_ENDDOWNLOADDATA or done or request ~= rosterRequest then return end
-        local f = io.open(path, 'r')
-        if not f then
-            finish(false, verbose and '{FF6060}Не удалось скачать общий список, оставлен сохранённый.' or nil)
-            return
-        end
-        local content = f:read('*a')
-        f:close()
-        local ver, list, leaders = parseRoster(content)
-        if not ver then
-            finish(false, verbose and '{FF6060}Общий список в неверном формате, оставлен сохранённый.' or nil)
-            return
-        end
-        local changed = ver ~= roster.version
-            or table.concat(list, '\n') ~= table.concat(roster.list, '\n')
-            or table.concat(leaders or CFG.default_leaders, '\n') ~= table.concat(leaderList(), '\n')
-        roster.version, roster.list, roster.leaders = ver, list, leaders
-        saveRosterCache(content)
-        local info = string.format('v%d, %d ников, лидеров %d.', ver, #list, #leaderList())
-        if verbose then
-            finish(true, 'Общий список загружен: ' .. info)
-        elseif changed then
-            finish(true, 'Общий список обновился: ' .. info)
-        else
-            finish(true)
-        end
+        if status ~= dlstatus.STATUS_ENDDOWNLOADDATA then return end
+        if done then os.remove(path) return end
+        local f = io.open(path, 'rb')
+        local content = f and f:read('*a')
+        if f then f:close() end
+        finish((content and content ~= '') and content or nil)
     end)
     lua_thread.create(function()
-        wait(timeoutMs or 10000)
-        if not done and request == rosterRequest then
-            finish(false, verbose and '{FF6060}Общий список не скачался, оставлен сохранённый. Проверь интернет.' or nil)
+        wait(timeoutMs)
+        finish(nil)
+    end)
+end
+
+local B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
+local B64_INDEX = {}
+for i = 1, 64 do B64_INDEX[B64:byte(i)] = i - 1 end
+
+local function base64Decode(s)
+    s = s:gsub('[^%w%+/=]', '')
+    local out, n = {}, 0
+    for i = 1, #s, 4 do
+        local a, b, c, d = s:byte(i, i + 3)
+        local A, B = B64_INDEX[a], a and b and B64_INDEX[b]
+        if not A or not B then break end
+        local C, D = c and B64_INDEX[c], d and B64_INDEX[d]
+        local v = A * 262144 + B * 4096 + (C or 0) * 64 + (D or 0)
+        n = n + 1; out[n] = string.char(math.floor(v / 65536) % 256)
+        if C then n = n + 1; out[n] = string.char(math.floor(v / 256) % 256) end
+        if D then n = n + 1; out[n] = string.char(v % 256) end
+    end
+    return table.concat(out)
+end
+
+-- Ответ API GitHub (JSON) -> содержимое файла, или nil
+local function decodeContentsJson(json)
+    if not json:find('"encoding"%s*:%s*"base64"') then return nil end
+    local b64 = json:match('"content"%s*:%s*"([^"]*)"')
+    if not b64 then return nil end
+    b64 = b64:gsub('\\n', ''):gsub('\\r', ''):gsub('\\/', '/')
+    local data = base64Decode(b64)
+    return data ~= '' and data or nil
+end
+
+-- Свежий файл из репозитория: cb(содержимое или nil, 'api' | 'raw')
+local function fetchRepoFile(path, timeoutMs, cb)
+    local g, t = CFG.github, os.time()
+    local api = string.format('https://api.github.com/repos/%s/%s/contents/%s?ref=%s&t=%d',
+        g.owner, g.repo, path, g.branch, t)
+    local raw = string.format('https://raw.githubusercontent.com/%s/%s/%s/%s?nocache=%d',
+        g.owner, g.repo, g.branch, path, t)
+    httpGet(api, timeoutMs, function(json)
+        local data = json and decodeContentsJson(json)
+        if data then
+            cb(data, 'api')
+            return
+        end
+        dbg('API GitHub не ответил для ' .. path .. ', беру по прямой ссылке')
+        httpGet(raw, timeoutMs, function(content) cb(content, 'raw') end)
+    end)
+end
+
+-- -------------------------- общий список ---------------------------
+local rosterWaiters   = nil   -- если не nil - список сейчас скачивается
+local rosterCheckedAt = -1000
+
+local function rosterBusy()
+    return rosterWaiters ~= nil
+end
+
+-- verbose - писать в чат и об успехе, и об ошибках (иначе - только если список изменился).
+-- onDone(ok) вызывается по завершении. Если список уже скачивается, запрос дожидается его.
+loadRemoteRoster = function(verbose, onDone, timeoutMs)
+    if rosterWaiters then
+        rosterWaiters[#rosterWaiters + 1] = { verbose = verbose, onDone = onDone }
+        return
+    end
+    rosterWaiters = { { verbose = verbose, onDone = onDone } }
+    rosterCheckedAt = os.clock()
+
+    fetchRepoFile(CFG.roster_path, timeoutMs or 8000, function(content, source)
+        local waiters = rosterWaiters
+        rosterWaiters = nil
+        local anyVerbose = false
+        for _, w in ipairs(waiters) do anyVerbose = anyVerbose or w.verbose end
+
+        local ok, text = false, nil
+        local ver, list, leaders
+        if content then ver, list, leaders = parseRoster(content) end
+        if not content then
+            text = '{FF6060}Общий список не скачался, оставлен сохранённый. Проверь интернет.'
+        elseif not ver then
+            text = '{FF6060}Общий список в неверном формате, оставлен сохранённый.'
+        else
+            ok = true
+            local oldHash = listHash()
+            local changed = ver ~= roster.version
+            roster.version, roster.list, roster.leaders = ver, list, leaders
+            roster.fetchedAt = os.clock()
+            changed = changed or listHash() ~= oldHash
+            saveRosterCache(content)
+            dbg('список получен через ' .. source)
+            local info = string.format('v%d, %d ников, лидеров %d.', ver, #list, #leaderList())
+            if anyVerbose then
+                text = 'Общий список загружен: ' .. info
+            elseif changed then
+                text = 'Общий список обновился: ' .. info
+            end
+        end
+        if text and (ok or anyVerbose) then msg(text) end
+        for _, w in ipairs(waiters) do
+            if w.onDone then w.onDone(ok) end
         end
     end)
 end
@@ -694,31 +796,21 @@ local function installUpdate(p)
 end
 
 local function checkForUpdate(verbose)
-    if update.checking or CFG.update_url == '' then return end
+    if update.checking then return end
     update.checking = true
     update.checkedAt = os.clock()
-    local dir = getWorkingDirectory() .. '\\config'
-    if not doesDirectoryExist(dir) then createDirectory(dir) end
-    local path = dir .. '\\sf_capture_update.tmp'
-    os.remove(path)
 
-    local done = false
     local function finish(text)
-        done = true
         update.checking = false
         if text then msg(text) end
     end
 
-    downloadUrlToFile(rosterDownloadUrl(CFG.update_url), path, function(id, status)
-        if status ~= dlstatus.STATUS_ENDDOWNLOADDATA or done then return end
-        local f = io.open(path, 'rb')
-        if not f then
-            finish(verbose and '{FF6060}Не удалось проверить обновления: файл не скачался.' or nil)
+    fetchRepoFile(CFG.script_path, 15000, function(content, source)
+        if not content then
+            finish(verbose and '{FF6060}Не удалось проверить обновления: нет ответа от GitHub.' or nil)
             return
         end
-        local content = f:read('*a')
-        f:close()
-        os.remove(path)
+        dbg('файл обновления получен через ' .. source)
 
         local newVersion = content:match("script_version%(%s*'([^']+)'%s*%)")
         local isOurs = content:find("script_name('AMARAYTHEN Capter')", 1, true)
@@ -745,12 +837,6 @@ local function checkForUpdate(verbose)
         finish(string.format('Найдено обновление v%s.%s', newVersion,
             state.phase ~= 'idle' and ' Установлю после флуда.' or ''))
     end)
-    lua_thread.create(function()
-        wait(15000)
-        if not done then
-            finish(verbose and '{FF6060}Не удалось проверить обновления: нет ответа от GitHub.' or nil)
-        end
-    end)
 end
 
 -- --------------------------- действия ------------------------------
@@ -774,14 +860,30 @@ local function leaderStart(delay, cd)
             msg('{FF6060}Общий список ещё ни разу не скачался - запуск невозможен. Проверь интернет.')
             return
         end
-        local line = string.format('%s %s GO %d %d %d', CFG.chat_cmd, CFG.code_prefix, delay, cd, roster.version)
+        local line = string.format('%s %s GO %d %d %d %s', CFG.chat_cmd, CFG.code_prefix,
+            delay, cd, roster.version, listHash())
         msg(string.format('Код запуска отправлен в %s (задержка %d мс, отсчёт %d с), жду ответ сервера...',
             CFG.chat_cmd, delay, cd))
         queueLeaderMessage('GO', line, CFG.go_tries)
     end
     -- перед запуском сверяемся с общим списком, чтобы у лидера была последняя версия
     msg('Проверяю список...')
-    loadRemoteRoster(false, send, 3000)
+    loadRemoteRoster(false, send, 2500)
+end
+
+-- Лидер просит всех сразу скачать свежий список
+local function leaderSync()
+    local nick = myNick() or ''
+    if not isLeader(nick) then
+        msg('Обновить список у всех может только лидер. Обнови у себя: /ac reload.')
+        return
+    end
+    if state.phase ~= 'idle' then
+        msg('Во время флуда нельзя, дождись конца или останови его.')
+        return
+    end
+    msg('Отправляю команду обновления в ' .. CFG.chat_cmd .. '...')
+    queueLeaderMessage('SYNC', CFG.chat_cmd .. ' ' .. CFG.code_prefix .. ' SYNC', 2)
 end
 
 local function leaderStop()
@@ -1296,10 +1398,30 @@ if hasImgui then
         drawListHeader(roster.version > 0 and string.format('Список  ·  v%d', roster.version) or 'Список',
             active, #roster.list)
         mutedWrapped('Порядок в списке - очерёдность в волне. Список общий для состава и обновляется сам.')
+        local age
+        if rosterBusy() then
+            age = 'обновляется...'
+        elseif roster.fetchedAt then
+            local s = os.clock() - roster.fetchedAt
+            age = s < 60 and 'обновлён только что' or string.format('обновлён %d мин назад', math.floor(s / 60))
+        else
+            age = roster.version > 0 and 'сохранённая копия, ещё не обновлялся' or 'ещё не загружен'
+        end
+        imgui.TextDisabled(u8(age))
         imgui.Dummy(V2(0, 2))
-        drawNickRows(roster.list, me, 'Список ещё не загружен.', 318)
+        drawNickRows(roster.list, me, 'Список ещё не загружен.', 296)
         imgui.Dummy(V2(0, 2))
-        if imgui.Button(u8'Обновить список', V2(contentWidth(), 32)) then loadRemoteRoster(true) end
+        if isLeader(me or '') then
+            local bw = (contentWidth() - 8) / 2
+            if imgui.Button(u8'Обновить у себя', V2(bw, 32)) then loadRemoteRoster(true) end
+            imgui.SameLine(0, 8)
+            glowRect(imgui.GetCursorScreenPos(), bw, 32, C_ACCENT, 7, 0.7)
+            if colorButton(u8'Обновить у всех', bw, 32, C_ACCENT, C_ACCENT_HI, C_ON_ACCENT) then
+                leaderSync()
+            end
+        else
+            if imgui.Button(u8'Обновить список', V2(contentWidth(), 32)) then loadRemoteRoster(true) end
+        end
     end
 
     local function drawLeadersTab()
@@ -1476,7 +1598,7 @@ local function menuOpen()
 end
 
 -- ----------------------------- команды -----------------------------
-local HELP = '/ac - меню, /ac start <мс> [отсчёт], /ac stop, /ac status, /ac list, /ac reload, /ac update'
+local HELP = '/ac - меню. Ещё: /ac start <мс> [отсчёт], stop, sync, status, list, reload, update'
 
 local function cmdSf(arg)
     local cmd, a1, a2 = (arg or ''):match('^%s*(%S*)%s*(%S*)%s*(%S*)')
@@ -1535,6 +1657,9 @@ local function cmdSf(arg)
     elseif cmd == 'update' then
         msg('Проверяю обновления... (текущая версия v' .. thisScript().version .. ')')
         checkForUpdate(true)
+
+    elseif cmd == 'sync' then
+        leaderSync()
 
     else
         msg(HELP)
@@ -1611,7 +1736,7 @@ function main()
     end
     loadRemoteRoster(true)
     if hasImgui then
-        msg('Меню: /ac. ' .. HELP)
+        msg(HELP)
     else
         msg('{FF6060}mimgui не найдена - меню недоступно, работают команды.')
         msg(HELP)
@@ -1637,7 +1762,7 @@ function main()
         end
 
         -- общий ростер перепроверяется сам, пока нет флуда
-        if state.phase == 'idle' and not rosterLoading
+        if state.phase == 'idle' and not rosterBusy()
             and now - rosterCheckedAt > CFG.roster_refresh then
             loadRemoteRoster(false)
         end
