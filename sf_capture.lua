@@ -1,6 +1,6 @@
 script_name('AMARAYTHEN Capter')
 script_author('amaru')
-script_version('2.7')
+script_version('2.8')
 script_description('AMARAYTHEN Capter by amaru: синхронный флуд /capture волной. Запуск лидером через /fc.')
 -- Совместимость с автообновлением v1.8-v1.9, которые ищут в новом файле прежнее имя.
 -- Не удалять: script_name('SF Capture')
@@ -274,12 +274,39 @@ local function recordPresence(nick)
 end
 
 -- Ники со скриптом, которые сейчас онлайн и отметились не позже presence_ttl секунд назад
+-- Других игроков со скриптом (без меня): в сети и отметились не позже presence_ttl секунд назад
 local function presentNicks()
     local now, out = os.clock(), {}
+    local me = myNick()
     for _, p in pairs(presence) do
-        if now - p.at <= CFG.presence_ttl and isOnline(p.nick) then out[#out + 1] = p.nick end
+        local isMe = me and norm(p.nick) == norm(me)
+        if not isMe and now - p.at <= CFG.presence_ttl and isOnline(p.nick) then out[#out + 1] = p.nick end
+    end
+    table.sort(out, function(a, b) return lower(a) < lower(b) end)
+    return out
+end
+
+-- Игроки из списка состава на GitHub, которые в сети, но не отозвались на сканирование:
+-- обычно это те, у кого старая версия скрипта без автоопределения (или скрипта нет вовсе)
+local function silentRosterNicks()
+    local now, out = os.clock(), {}
+    local me = myNick()
+    for _, n in ipairs(roster.list) do
+        local p = presence[norm(n)]
+        local isMe = me and norm(n) == norm(me)
+        local responded = p and now - p.at <= CFG.presence_ttl
+        if not isMe and not responded and isOnline(n) then out[#out + 1] = n end
     end
     return out
+end
+
+-- Подсказка лидеру после сканирования
+local function silentHint()
+    local silent = silentRosterNicks()
+    if #silent > 0 then
+        msg(string.format('Из списка состава в сети ещё %d, но они не отозвались - вероятно, старая версия скрипта.', #silent))
+        msg('Пока все не обновятся до этой версии, запускай с выключенным автоопределением.')
+    end
 end
 
 -- Текущий игровой ID по нику (ник со временем мог сменить ID)
@@ -524,7 +551,8 @@ local function handleCode(clean, codePos)
     local me = myNick()
     local fromMe = me and norm(me) == norm(sender)
 
-    recordPresence(sender)  -- любой служебный код подтверждает: этот игрок со скриптом
+    -- любой служебный код подтверждает: этот игрок со скриптом (свои сообщения не считаем)
+    if not fromMe then recordPresence(sender) end
 
     -- #SF HI - отклик на сканирование (присутствие уже записано recordPresence выше)
     if rest:match('^%s+HI') then
@@ -1150,9 +1178,9 @@ local function finalizeAutoLaunch()
     if count < 2 then
         -- На GitHub-список не откатываемся автоматически: там могут быть без скрипта, волна с дырами.
         -- Запасной режим включается вручную - выключить автоопределение в настройках.
-        msg('Со скриптом в сети больше никого, запускаю один.')
-        msg('Нужно по списку состава - выключи автоопределение в настройках.')
+        msg('Со скриптом в сети больше никого не отозвалось, запускаю один.')
     end
+    silentHint()
     sendAutoGo(p.delay, p.cd, idstr, count, trimmed)
 end
 
@@ -1208,6 +1236,7 @@ local function leaderScan()
             local present = presentNicks()
             lastScanInfo = { at = os.clock(), count = #present + 1 }
             msg(string.format('Со скриптом в сети: %d (включая тебя).', #present + 1))
+            silentHint()
         end)
     end)
 end
@@ -1784,11 +1813,16 @@ if hasImgui then
                 info = s < 15 and 'сканировано только что' or string.format('сканировано %d с назад', math.floor(s))
             end
             imgui.TextDisabled(u8(info))
+            local silent = silentRosterNicks()
+            if #silent > 0 then
+                wrappedColored(C_ACCENT, string.format('Ещё %d из списка состава в сети, но не отозвались - ' ..
+                    'вероятно, у них старая версия. Пока все не обновятся, запускай без автоопределения.', #silent))
+            end
             imgui.Dummy(V2(0, 2))
             -- я + отозвавшиеся
             local shown = { me or '?' }
             for _, n in ipairs(present) do shown[#shown + 1] = n end
-            drawNickRows(shown, me, 'Пока никто не отозвался.', 296)
+            drawNickRows(shown, me, 'Пока никто не отозвался.', #silent > 0 and 256 or 296)
             imgui.Dummy(V2(0, 2))
             if leader then
                 glowRect(imgui.GetCursorScreenPos(), contentWidth(), 32, C_ACCENT, 7, 0.7)
