@@ -1,6 +1,6 @@
 script_name('AMARAYTHEN Capter')
 script_author('amaru')
-script_version('2.4')
+script_version('2.5')
 script_description('AMARAYTHEN Capter by amaru: синхронный флуд /capture волной. Запуск лидером через /fc.')
 -- Совместимость с автообновлением v1.8-v1.9, которые ищут в новом файле прежнее имя.
 -- Не удалять: script_name('SF Capture')
@@ -785,30 +785,66 @@ end
 
 local httpSeq = 0
 
--- Скачивает url, вызывает cb(содержимое) или cb(nil) при ошибке или по таймауту
+local function fileSize(path)
+    local f = io.open(path, 'rb')
+    if not f then return nil end
+    local size = f:seek('end')
+    f:close()
+    return size
+end
+
+-- Скачивает url, вызывает cb(содержимое) или cb(nil) при ошибке или по таймауту.
+-- Сигнал STATUS_ENDDOWNLOADDATA приходит, когда данные получены, но Windows может ещё
+-- дописывать файл на диск - большие файлы тогда читались обрезанными. Поэтому файл читается
+-- по окончательному сигналу MoonLoader STATUSEX_ENDDOWNLOAD, а если его нет - когда размер
+-- файла перестал меняться.
 local function httpGet(url, timeoutMs, cb)
     httpSeq = httpSeq + 1
     local dir = getWorkingDirectory() .. '\\config'
     if not doesDirectoryExist(dir) then createDirectory(dir) end
     local path = string.format('%s\\sf_download_%d.tmp', dir, httpSeq)
     os.remove(path)
-    local done = false
+    local EX_END = dlstatus.STATUSEX_ENDDOWNLOAD
+    local done, dataEnded, fullyEnded = false, false, false
+
     local function finish(content)
         if done then return end
         done = true
         os.remove(path)
         cb(content)
     end
-    downloadUrlToFile(url, path, function(id, status)
-        if status ~= dlstatus.STATUS_ENDDOWNLOADDATA then return end
-        if done then os.remove(path) return end
+    local function readNow()
+        if done then return end
         local f = io.open(path, 'rb')
         local content = f and f:read('*a')
         if f then f:close() end
         finish((content and content ~= '') and content or nil)
+    end
+
+    downloadUrlToFile(url, path, function(id, status)
+        if EX_END and status == EX_END then
+            fullyEnded = true
+            if done then os.remove(path) else readNow() end
+        elseif status == dlstatus.STATUS_ENDDOWNLOADDATA then
+            dataEnded = true
+        end
     end)
+
     lua_thread.create(function()
-        wait(timeoutMs)
+        local deadline = os.clock() + timeoutMs / 1000
+        local last, stable = -1, 0
+        -- со STATUSEX_ENDDOWNLOAD ждём его (но не дольше ~1.5 с после конца данных),
+        -- без него - пока размер файла не меняется целую секунду
+        local need = EX_END and 15 or 10
+        while not done and os.clock() < deadline do
+            wait(100)
+            if dataEnded and not fullyEnded and not done then
+                local size = fileSize(path)
+                if size and size > 0 and size == last then stable = stable + 1 else stable = 0 end
+                last = size or -1
+                if stable >= need then readNow() end
+            end
+        end
         finish(nil)
     end)
 end
@@ -833,13 +869,19 @@ local function base64Decode(s)
     return table.concat(out)
 end
 
--- Ответ API GitHub (JSON) -> содержимое файла, или nil
+-- Ответ API GitHub (JSON) -> содержимое файла, или nil.
+-- Размер раскодированного файла сверяется с полем "size": так отсекается обрезанный ответ.
 local function decodeContentsJson(json)
     if not json:find('"encoding"%s*:%s*"base64"') then return nil end
     local b64 = json:match('"content"%s*:%s*"([^"]*)"')
     if not b64 then return nil end
     b64 = b64:gsub('\\n', ''):gsub('\\r', ''):gsub('\\/', '/')
     local data = base64Decode(b64)
+    local size = tonumber(json:match('"size"%s*:%s*(%d+)'))
+    if size and #data ~= size then
+        dbg(string.format('ответ API неполный: %d из %d байт', #data, size))
+        return nil
+    end
     return data ~= '' and data or nil
 end
 
@@ -977,6 +1019,13 @@ local function checkForUpdate(verbose)
         end
         if not isNewerVersion(newVersion, thisScript().version) then
             finish(verbose and ('Обновлений нет, у тебя последняя версия v' .. thisScript().version .. '.') or nil)
+            return
+        end
+        -- Последняя строка файла - метка конца. Нет её - файл скачался не полностью:
+        -- пробую снова через минуту, а не через полчаса.
+        if not content:match('SF%-CAPTURE: конец файла%s*$') then
+            update.checkedAt = os.clock() - CFG.update_interval + 60
+            finish('{FF6060}Обновление v' .. newVersion .. ' скачалось не полностью, повторю через минуту.')
             return
         end
         if not content:find(UPDATE_MARKER, 1, true) then
@@ -2072,3 +2121,5 @@ function main()
         end
     end
 end
+-- Следующая строка должна оставаться последней: по ней автообновление проверяет, что файл скачался целиком.
+-- SF-CAPTURE: конец файла
