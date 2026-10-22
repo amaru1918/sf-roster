@@ -1,12 +1,14 @@
 3
 [leaders]
 Escay_Eastwood
+Karl_Branting
 Amaru_Noster
 [roster]
 Escay_Eastwood
 Amaru_Noster
 Dmitriy_Cigano
 Sakhalin_Navarro
+Karl_Branting
 Tatsuki_Sunsetik
 Scottz_Monteiro
 Igor_Grebenn
