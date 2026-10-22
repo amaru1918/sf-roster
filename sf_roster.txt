@@ -1,6 +1,10 @@
-   1
-   Escay_Eastwood
-   Amaru_Noster
-   Dmitriy_Cigano
-   Sakhalin_Navarro
-   Tatsuki_Sunsetik
+3
+[leaders]
+Escay_Eastwood
+Amaru_Noster
+[roster]
+Escay_Eastwood
+Amaru_Noster
+Dmitriy_Cigano
+Sakhalin_Navarro
+Tatsuki_Sunsetik
