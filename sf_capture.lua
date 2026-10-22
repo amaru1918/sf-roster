@@ -1,6 +1,6 @@
 script_name('AMARAYTHEN Capter')
 script_author('amaru')
-script_version('2.3')
+script_version('2.4')
 script_description('AMARAYTHEN Capter by amaru: синхронный флуд /capture волной. Запуск лидером через /fc.')
 -- Совместимость с автообновлением v1.8-v1.9, которые ищут в новом файле прежнее имя.
 -- Не удалять: script_name('SF Capture')
@@ -36,6 +36,15 @@ local CFG = {
     default_leaders = { 'Escay_Eastwood' },
     auto_update     = true,
     update_interval = 1800,       -- как часто проверять обновления, с
+
+    -- Автоопределение участников: кто со скриптом и в сети, тот и в волне.
+    -- Лидеры при этом по-прежнему берутся с GitHub, а GitHub-ростер - запасной.
+    auto_discovery  = true,
+    scan_wait       = 1.8,        -- сколько лидер собирает отклики перед запуском, с
+    presence_ttl    = 90,         -- сколько секунд ник считается «в сети со скриптом»
+    hi_jitter       = 0.8,        -- случайная задержка отклика, чтобы не было всплеска в чате, с
+    hi_cooldown     = 2,          -- не отвечать на сканирование чаще раза в N секунд
+    max_participants = 30,        -- предел участников в одном коде запуска (лимит длины чата)
 
     chat_cmd          = '/fc',       -- чат управления
     code_prefix       = '#SF',       -- метка служебных сообщений
@@ -218,7 +227,7 @@ local function detectSender(head)
     return bestNick
 end
 
--- Мой слот среди тех, кто из ростера сейчас онлайн
+-- Мой слот среди тех, кто из GitHub-ростера сейчас онлайн (запасной режим)
 local function computeSlot()
     local me = myNick()
     local active, slot = 0, nil
@@ -227,6 +236,72 @@ local function computeSlot()
             if me and norm(n) == norm(me) then slot = active end
             active = active + 1
         end
+    end
+    return slot, active
+end
+
+-- Мой игровой ID на сервере
+local function myId()
+    local ok, id = sampGetPlayerIdByCharHandle(PLAYER_PED)
+    return ok and id or nil
+end
+
+-- ------------------- присутствие (кто со скриптом) -----------------
+-- Заполняется, когда приходит отклик #SF HI или любой служебный код от игрока со скриптом.
+local presence = {}        -- [норм.ник] = { nick = ник, at = время }
+local lastScanInfo = nil   -- { at, count } - результат последнего сканирования
+
+local function recordPresence(nick)
+    if not nick or nick == '' then return end
+    presence[norm(nick)] = { nick = nick, at = os.clock() }
+end
+
+-- Ники со скриптом, которые сейчас онлайн и отметились не позже presence_ttl секунд назад
+local function presentNicks()
+    local now, out = os.clock(), {}
+    for _, p in pairs(presence) do
+        if now - p.at <= CFG.presence_ttl and isOnline(p.nick) then out[#out + 1] = p.nick end
+    end
+    return out
+end
+
+-- Текущий игровой ID по нику (ник со временем мог сменить ID)
+local function idByNick(nick)
+    local me = myNick()
+    if me and norm(me) == norm(nick) then return myId() end
+    for id = 0, sampGetMaxPlayerId(false) do
+        if sampIsPlayerConnected(id) and norm(sampGetPlayerNickname(id)) == norm(nick) then return id end
+    end
+    return nil
+end
+
+-- Список ID участников для кода запуска: я + присутствующие, по возрастанию ID.
+-- Возвращает строку "id1.id2..." и число участников (может быть обрезан по max_participants).
+local function buildParticipantIds()
+    local ids, seen = {}, {}
+    local function add(id) if id and not seen[id] then seen[id] = true; ids[#ids + 1] = id end end
+    add(myId())
+    for _, nick in ipairs(presentNicks()) do add(idByNick(nick)) end
+    table.sort(ids)
+    local trimmed = false
+    if #ids > CFG.max_participants then
+        while #ids > CFG.max_participants do table.remove(ids) end
+        trimmed = true
+    end
+    local parts = {}
+    for _, id in ipairs(ids) do parts[#parts + 1] = tostring(id) end
+    return table.concat(parts, '.'), #ids, trimmed
+end
+
+-- Мой слот среди присутствующих по строке ID из кода запуска.
+-- Возвращает slot (0-based) и число участников, или nil если меня нет в наборе.
+local function computeSlotFromIds(idstr)
+    local mine = myId()
+    local active, slot = 0, nil
+    for id in idstr:gmatch('%d+') do
+        id = tonumber(id)
+        if mine and id == mine then slot = active end
+        active = active + 1
     end
     return slot, active
 end
@@ -247,14 +322,9 @@ end
 local loadRemoteRoster  -- объявлены ниже, в разделе "ростер"
 local applyCachedRoster
 
--- codeAt - когда пришёл код запуска (если подключаемся с опозданием после обновления списка).
--- Совпадение списков проверяется до вызова.
-local function beginCountdown(leader, delay, cd, codeAt)
-    local slot, active = computeSlot()
-    if not slot then
-        msg('Тебя нет в списке, в этом запуске не участвуешь.')
-        return
-    end
+-- Общая настройка волны по готовым слоту и числу участников.
+-- codeAt - когда пришёл код запуска (если подключаемся с опозданием).
+local function startWave(leader, delay, cd, slot, active, codeAt)
     delay = math.max(CFG.min_delay, math.min(CFG.max_delay, delay))
 
     -- Сервер рассылает код всем одновременно. Мой /capture идёт до сервера ещё полпинга,
@@ -283,16 +353,37 @@ local function beginCountdown(leader, delay, cd, codeAt)
         math.max(0, math.ceil(state.startAt - os.clock())), ping))
 end
 
+-- Запасной режим: слот по GitHub-ростеру. Совпадение списков проверяется до вызова.
+local function beginCountdown(leader, delay, cd, codeAt)
+    local slot, active = computeSlot()
+    if not slot then
+        msg('Тебя нет в списке, в этом запуске не участвуешь.')
+        return
+    end
+    startWave(leader, delay, cd, slot, active, codeAt)
+end
+
+-- Авто-режим: слот по строке ID участников от лидера (одинаковой у всех).
+local function beginCountdownAuto(leader, delay, cd, idstr, codeAt)
+    local slot, active = computeSlotFromIds(idstr)
+    if not slot then
+        msg('Тебя нет среди участников этого запуска (нет отклика на сканирование).')
+        return
+    end
+    startWave(leader, delay, cd, slot, active, codeAt)
+end
+
 -- -------------------- сообщения лидера в чат -----------------------
 -- Сервер отбрасывает сообщение в чат, если перед ним игрок только что отправил /capture
 -- (антифлуд). Поэтому код запуска и стоп уходят после паузы, а если лидер не увидел
 -- своё сообщение в чате - отправляются повторно.
 local outbox = nil
 
-local function queueLeaderMessage(kind, text, maxTries)
+-- after - необязательная функция, вызывается, когда сообщение вернулось из чата (подтвердилось)
+local function queueLeaderMessage(kind, text, maxTries, after)
     local now = os.clock()
     outbox = {
-        kind = kind, text = text, tries = 0, maxTries = maxTries,
+        kind = kind, text = text, tries = 0, maxTries = maxTries, after = after,
         sendAt = math.max(now, state.lastSendAt + CFG.chat_pause), confirmUntil = nil,
     }
 end
@@ -300,8 +391,9 @@ end
 -- true, если это подтверждение моего сообщения; второе значение - номер попытки
 local function confirmOutbox(kind)
     if outbox and outbox.kind == kind and outbox.tries > 0 then
-        local tries = outbox.tries
+        local tries, after = outbox.tries, outbox.after
         outbox = nil
+        if after then after() end
         return true, tries
     end
     return false
@@ -329,6 +421,8 @@ local function processOutbox(now)
                     ' или не распознан. Включи /ac debug и повтори запуск.')
             elseif kind == 'SYNC' then
                 msg('{FF6060}Команда обновления не прошла в ' .. CFG.chat_cmd .. '. Повтори /ac sync.')
+            elseif kind == 'SCAN' then
+                msg('{FF6060}Сканирование не прошло в ' .. CFG.chat_cmd .. '. Повтори запуск.')
             else
                 msg('{FF6060}Стоп не прошёл в ' .. CFG.chat_cmd ..
                     '. Повтори /ac stop, иначе остальные остановятся по автостопу.')
@@ -337,18 +431,47 @@ local function processOutbox(now)
     end
 end
 
+-- Отклик на сканирование: сообщаю, что я со скриптом. С разбросом по времени,
+-- чтобы отклики всех не легли в чат одним всплеском (антифлуд сервера).
+local lastHiAt = -100
+local function replyPresence()
+    if os.clock() - lastHiAt < CFG.hi_cooldown then return end
+    lastHiAt = os.clock()
+    lua_thread.create(function()
+        wait(math.random(0, math.floor(CFG.hi_jitter * 1000)))
+        if os.clock() - state.lastSendAt < CFG.chat_pause then wait(math.floor(CFG.chat_pause * 1000)) end
+        state.lastSendAt = os.clock()
+        sampSendChat(CFG.chat_cmd .. ' ' .. CFG.code_prefix .. ' HI')
+    end)
+end
+
 -- Разбор служебного кода. Возвращает true, если код распознан (тогда строка скрывается).
 -- Форматы (без двоеточий, чтобы антиреклама сервера не приняла цифры за IP:порт):
---   #SF GO <задержка> <отсчёт> <версия списка> <отпечаток списка>
---   #SF STOP
---   #SF SYNC  - лидер просит всех обновить список
--- Старые версии скрипта не знают про отпечаток и просто его не читают.
+--   #SF GO <задержка> <отсчёт> A <id1>.<id2>...   - авто-режим, участники по ID от лидера
+--   #SF GO <задержка> <отсчёт> <версия> <отпечаток> - запасной режим по GitHub-ростеру
+--   #SF STOP / #SF SYNC / #SF SCAN / #SF HI
+-- Старые версии знают только запасной GO и игнорируют остальное.
 
 -- Мой список отличается от лидерского: скачиваем свежий прямо во время отсчёта.
 -- Лидер ли отправитель, решает уже свежий список (так подхватываются и новые лидеры),
 -- а к волне подключаемся с учётом времени, ушедшего на загрузку.
 local lastForeignCatchUp = -100
 local lastSyncAt = -100
+
+-- Авто-запуск от того, кого у меня нет в лидерах: обновляю лидеров с GitHub и проверяю снова
+local function catchUpLeaderAuto(sender, delay, cd, idstr)
+    local receivedAt = os.clock()
+    dbg(string.format('авто-код от %s, его нет в моих лидерах - проверяю общий список', sender))
+    loadRemoteRoster(false, function()
+        if not isLeader(sender) then
+            dbg('после обновления ' .. sender .. ' всё равно не лидер - игнор')
+        elseif state.lastStopAt >= receivedAt then
+            msg('Пока обновлялся список, лидер уже остановил запуск.')
+        elseif state.phase == 'idle' then
+            beginCountdownAuto(sender, delay, cd, idstr, receivedAt)
+        end
+    end)
+end
 
 local function catchUpAndStart(sender, delay, cd, ver, hash)
     local receivedAt = os.clock()
@@ -384,6 +507,29 @@ local function handleCode(clean, codePos)
     local me = myNick()
     local fromMe = me and norm(me) == norm(sender)
 
+    recordPresence(sender)  -- любой служебный код подтверждает: этот игрок со скриптом
+
+    -- #SF HI - отклик на сканирование (присутствие уже записано recordPresence выше)
+    if rest:match('^%s+HI') then
+        return true
+    end
+
+    -- Авто-GO: #SF GO <задержка> <отсчёт> A <id1>.<id2>...
+    local ad, acd, aids = rest:match('^%s+GO%s+(%d+)%s+(%d+)%s+[Aa]%s+([%d%.]+)')
+    if ad then
+        ad, acd = tonumber(ad), tonumber(acd)
+        if not isLeader(sender) then
+            if os.clock() - lastForeignCatchUp < 10 then return false end
+            lastForeignCatchUp = os.clock()
+            if fromMe then confirmOutbox('GO') end
+            catchUpLeaderAuto(sender, ad, acd, aids)
+            return true
+        end
+        if fromMe then confirmOutbox('GO') end
+        beginCountdownAuto(sender, ad, acd, aids)
+        return true
+    end
+
     local d, cd, ver, hash = rest:match('^%s+GO%s+(%d+)%s+(%d+)%s+(%d+)%s*(%w*)')
     if d then
         d, cd, ver = tonumber(d), tonumber(cd), tonumber(ver)
@@ -407,6 +553,11 @@ local function handleCode(clean, codePos)
     if not isLeader(sender) then
         dbg('код от ' .. sender .. ', он не в списке лидеров - игнор')
         return false
+    end
+    -- #SF SCAN - лидер спрашивает, кто со скриптом в сети; откликаюсь, если это не я
+    if rest:match('^%s+SCAN') then
+        if fromMe then confirmOutbox('SCAN') else replyPresence() end
+        return true
     end
     if rest:match('^%s+SYNC') then
         if fromMe then confirmOutbox('SYNC') end
@@ -461,6 +612,10 @@ local function buildConfigText(o)
         '',
         '; Автообновление скрипта (true/false)',
         'auto_update = ' .. tostring(o.auto_update ~= false),
+        '',
+        '; Автоопределение участников: в волне те, кто со скриптом и в сети.',
+        '; false - брать участников из списка состава на GitHub (true/false)',
+        'auto_discovery = ' .. tostring(o.auto_discovery ~= false),
     }
     return table.concat(L, '\n') .. '\n'
 end
@@ -469,7 +624,7 @@ local function currentSettings()
     return {
         chat_cmd = CFG.chat_cmd, countdown = CFG.default_countdown, max_duration = CFG.max_duration,
         hide_responses = CFG.hide_responses, ping_compensation = CFG.ping_compensation,
-        auto_update = CFG.auto_update,
+        auto_update = CFG.auto_update, auto_discovery = CFG.auto_discovery,
     }
 end
 
@@ -544,6 +699,7 @@ local function loadConfig(verbose)
     if s.hide_responses then CFG.hide_responses = lower(s.hide_responses) == 'true' end
     CFG.ping_compensation = lower(s.ping_compensation or 'true') ~= 'false'
     CFG.auto_update       = lower(s.auto_update or 'true') ~= 'false'
+    CFG.auto_discovery    = lower(s.auto_discovery or 'true') ~= 'false'
 
     -- конфиг от старой версии: убираем из него ссылки и списки ников, настройки сохраняем
     if c.obsolete then
@@ -840,6 +996,43 @@ local function checkForUpdate(verbose)
 end
 
 -- --------------------------- действия ------------------------------
+local pendingGo = nil   -- запланированный авто-запуск: ждём откликов на сканирование
+
+-- Запасной запуск по GitHub-ростеру (когда автоопределение выключено или никого не нашло)
+local function sendFallbackGo(delay, cd)
+    local line = string.format('%s %s GO %d %d %d %s', CFG.chat_cmd, CFG.code_prefix,
+        delay, cd, roster.version, listHash())
+    msg(string.format('Код запуска отправлен в %s (по списку состава, задержка %d мс, отсчёт %d с)...',
+        CFG.chat_cmd, delay, cd))
+    queueLeaderMessage('GO', line, CFG.go_tries)
+end
+
+-- Авто-запуск: разослать ID присутствующих одним кодом
+local function sendAutoGo(delay, cd, idstr, count, trimmed)
+    if trimmed then
+        msg(string.format('{FF6060}Слишком много участников, взял первых %d.', CFG.max_participants))
+    end
+    local line = string.format('%s %s GO %d %d A %s', CFG.chat_cmd, CFG.code_prefix, delay, cd, idstr)
+    msg(string.format('Код запуска отправлен в %s (участников: %d, задержка %d мс, отсчёт %d с)...',
+        CFG.chat_cmd, count, delay, cd))
+    queueLeaderMessage('GO', line, CFG.go_tries)
+end
+
+-- Срабатывает в главном цикле, когда прошло время сбора откликов на сканирование
+local function finalizeAutoLaunch()
+    local p = pendingGo
+    pendingGo = nil
+    local idstr, count, trimmed = buildParticipantIds()
+    lastScanInfo = { at = os.clock(), count = count }
+    if count < 2 then
+        -- На GitHub-список не откатываемся автоматически: там могут быть без скрипта, волна с дырами.
+        -- Запасной режим включается вручную - выключить автоопределение в настройках.
+        msg('Со скриптом в сети больше никого, запускаю один.')
+        msg('Нужно по списку состава - выключи автоопределение в настройках.')
+    end
+    sendAutoGo(p.delay, p.cd, idstr, count, trimmed)
+end
+
 local function leaderStart(delay, cd)
     delay = math.floor(delay)
     if delay < CFG.min_delay or delay > CFG.max_delay then
@@ -848,27 +1041,52 @@ local function leaderStart(delay, cd)
     end
     cd = math.max(0, math.min(30, math.floor(cd)))
 
-    -- права лидера проверяются по свежему списку: так сразу работают и новые лидеры,
-    -- и снятые с лидерства теряют права без ожидания автообновления
-    local function send()
+    -- Сверяемся со свежим списком: нужны актуальные лидеры (и ростер для запасного режима)
+    msg('Проверяю список...')
+    loadRemoteRoster(false, function()
         local nick = myNick() or ''
         if not isLeader(nick) then
             msg('Запускать может только лидер. Твой ник в игре: ' .. (nick ~= '' and nick or 'не определён') .. '.')
             return
         end
-        if roster.version == 0 then
-            msg('{FF6060}Общий список ещё ни разу не скачался - запуск невозможен. Проверь интернет.')
+
+        if not CFG.auto_discovery then
+            if roster.version == 0 then
+                msg('{FF6060}Общий список ещё ни разу не скачался - запуск невозможен. Проверь интернет.')
+                return
+            end
+            sendFallbackGo(delay, cd)
             return
         end
-        local line = string.format('%s %s GO %d %d %d %s', CFG.chat_cmd, CFG.code_prefix,
-            delay, cd, roster.version, listHash())
-        msg(string.format('Код запуска отправлен в %s (задержка %d мс, отсчёт %d с), жду ответ сервера...',
-            CFG.chat_cmd, delay, cd))
-        queueLeaderMessage('GO', line, CFG.go_tries)
+
+        -- автоопределение: сначала рассылаем сканирование, собираем отклики, потом код запуска
+        msg('Сканирую, кто со скриптом в сети...')
+        queueLeaderMessage('SCAN', CFG.chat_cmd .. ' ' .. CFG.code_prefix .. ' SCAN', 2, function()
+            pendingGo = { delay = delay, cd = cd, at = os.clock() + CFG.scan_wait }
+        end)
+    end, 2500)
+end
+
+-- Отдельное сканирование (кнопка/команда): узнать, кто со скриптом в сети
+local function leaderScan()
+    local nick = myNick() or ''
+    if not isLeader(nick) then
+        msg('Сканировать может только лидер.')
+        return
     end
-    -- перед запуском сверяемся с общим списком, чтобы у лидера была последняя версия
-    msg('Проверяю список...')
-    loadRemoteRoster(false, send, 2500)
+    if state.phase ~= 'idle' or outbox or pendingGo then
+        msg('Сейчас занят, повтори чуть позже.')
+        return
+    end
+    msg('Сканирую, кто со скриптом в сети...')
+    queueLeaderMessage('SCAN', CFG.chat_cmd .. ' ' .. CFG.code_prefix .. ' SCAN', 2, function()
+        lua_thread.create(function()
+            wait(math.floor(CFG.scan_wait * 1000) + 400)
+            local present = presentNicks()
+            lastScanInfo = { at = os.clock(), count = #present + 1 }
+            msg(string.format('Со скриптом в сети: %d (включая тебя).', #present + 1))
+        end)
+    end)
 end
 
 -- Лидер просит всех сразу скачать свежий список
@@ -939,6 +1157,7 @@ if hasImgui then
         hide      = new.bool(false),
         ping      = new.bool(true),
         autoUpd   = new.bool(true),
+        autoDisc  = new.bool(true),
         debug     = new.bool(false),
         dirty     = false,
         online    = {},
@@ -956,6 +1175,7 @@ if hasImgui then
         ui.hide[0]      = CFG.hide_responses
         ui.ping[0]      = CFG.ping_compensation
         ui.autoUpd[0]   = CFG.auto_update
+        ui.autoDisc[0]  = CFG.auto_discovery
         ui.countdown[0] = CFG.default_countdown
         ui.dirty        = false
     end
@@ -1005,6 +1225,7 @@ if hasImgui then
             hide_responses    = ui.hide[0],
             ping_compensation = ui.ping[0],
             auto_update       = ui.autoUpd[0],
+            auto_discovery    = ui.autoDisc[0],
         }
         if not writeConfig(o) then
             setNotice('Не удалось записать sf_capture.ini.', true)
@@ -1394,6 +1615,38 @@ if hasImgui then
     local function drawRosterTab()
         refreshOnline()
         local me = myNick()
+        local leader = isLeader(me or '')
+
+        if CFG.auto_discovery then
+            local present = presentNicks()
+            drawListHeader('Со скриптом в сети', #present + 1, #present + 1)
+            mutedWrapped('В волне участвуют те, у кого есть скрипт и кто сейчас в сети. ' ..
+                'Нажми «Сканировать», чтобы обновить список.')
+            local info
+            if not lastScanInfo then
+                info = 'ещё не сканировал в этой сессии'
+            else
+                local s = os.clock() - lastScanInfo.at
+                info = s < 15 and 'сканировано только что' or string.format('сканировано %d с назад', math.floor(s))
+            end
+            imgui.TextDisabled(u8(info))
+            imgui.Dummy(V2(0, 2))
+            -- я + отозвавшиеся
+            local shown = { me or '?' }
+            for _, n in ipairs(present) do shown[#shown + 1] = n end
+            drawNickRows(shown, me, 'Пока никто не отозвался.', 296)
+            imgui.Dummy(V2(0, 2))
+            if leader then
+                glowRect(imgui.GetCursorScreenPos(), contentWidth(), 32, C_ACCENT, 7, 0.7)
+                if colorButton(u8'Сканировать', contentWidth(), 32, C_ACCENT, C_ACCENT_HI, C_ON_ACCENT) then
+                    leaderScan()
+                end
+            else
+                imgui.TextDisabled(u8'Сканирование запускает лидер.')
+            end
+            return
+        end
+
         local active = rosterOnline(me)
         drawListHeader(roster.version > 0 and string.format('Список  ·  v%d', roster.version) or 'Список',
             active, #roster.list)
@@ -1411,7 +1664,7 @@ if hasImgui then
         imgui.Dummy(V2(0, 2))
         drawNickRows(roster.list, me, 'Список ещё не загружен.', 296)
         imgui.Dummy(V2(0, 2))
-        if isLeader(me or '') then
+        if leader then
             local bw = (contentWidth() - 8) / 2
             if imgui.Button(u8'Обновить у себя', V2(bw, 32)) then loadRemoteRoster(true) end
             imgui.SameLine(0, 8)
@@ -1449,6 +1702,10 @@ if hasImgui then
             ui.dirty = true
         end
         imgui.PopItemWidth()
+
+        sectionTitle('УЧАСТНИКИ')
+        if imgui.Checkbox(u8'Автоопределение (кто со скриптом, тот в волне)', ui.autoDisc) then ui.dirty = true end
+        imgui.TextDisabled(u8'Выкл - участники из списка состава на GitHub.')
 
         sectionTitle('ПОВЕДЕНИЕ')
         if imgui.Checkbox(u8'Поправка на пинг (рекомендуется)', ui.ping) then ui.dirty = true end
@@ -1598,7 +1855,7 @@ local function menuOpen()
 end
 
 -- ----------------------------- команды -----------------------------
-local HELP = '/ac - меню. Ещё: /ac start <мс> [отсчёт], stop, sync, status, list, reload, update'
+local HELP = '/ac - меню. Ещё: /ac start <мс> [отсчёт], stop, scan, sync, status, list, reload, update'
 
 local function cmdSf(arg)
     local cmd, a1, a2 = (arg or ''):match('^%s*(%S*)%s*(%S*)%s*(%S*)')
@@ -1660,6 +1917,9 @@ local function cmdSf(arg)
 
     elseif cmd == 'sync' then
         leaderSync()
+
+    elseif cmd == 'scan' then
+        leaderScan()
 
     else
         msg(HELP)
@@ -1726,6 +1986,7 @@ function main()
     if not isSampLoaded() or not isSampfuncsLoaded() then return end
     while not isSampAvailable() do wait(100) end
 
+    math.randomseed(os.time() + (myId() or 0))  -- чтобы разброс откликов был у всех разный
     sampRegisterChatCommand('ac', cmdSf)
     loadConfig(false)
     if roster.version > 0 then
@@ -1749,8 +2010,13 @@ function main()
 
         processOutbox(now)
 
+        -- запланированный авто-запуск: собрали отклики - отправляем код
+        if pendingGo and now >= pendingGo.at and not outbox then
+            finalizeAutoLaunch()
+        end
+
         -- автообновление: только когда нет флуда и лидер ничего не ждёт из чата
-        if state.phase == 'idle' and not outbox then
+        if state.phase == 'idle' and not outbox and not pendingGo then
             if update.pending then
                 local p = update.pending
                 update.pending = nil
