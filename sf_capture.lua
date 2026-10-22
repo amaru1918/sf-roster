@@ -1,6 +1,6 @@
 script_name('AMARAYTHEN Capter')
 script_author('amaru')
-script_version('2.9')
+script_version('3.1')
 script_description('AMARAYTHEN Capter by amaru: синхронный флуд /capture волной. Запуск лидером через /fc.')
 -- Совместимость с автообновлением v1.8-v1.9, которые ищут в новом файле прежнее имя.
 -- Не удалять: script_name('SF Capture')
@@ -34,6 +34,9 @@ local CFG = {
     sync_cooldown   = 5,          -- не чаще раза в N секунд выполнять «обновить у всех»
     -- Лидеры, пока общий список ещё ни разу не скачан или в нём нет секции [leaders].
     default_leaders = { 'Escay_Eastwood' },
+    -- Встроенные лидеры: признаются всегда, даже если у игрока не открывается GitHub.
+    -- Остальные лидеры - из секции [leaders] общего списка. Меняются только с новой версией скрипта.
+    builtin_leaders = { 'Escay_Eastwood', 'Amaru_Noster' },
     auto_update     = true,
     update_interval = 1800,       -- как часто проверять обновления, с
 
@@ -49,6 +52,9 @@ local CFG = {
     -- Так игроки со скриптом сами появляются в списке у лидеров.
     announce_on_join = true,
     announce_delay   = { 6, 15 }, -- через сколько секунд после появления в игре (случайно в этих пределах)
+    -- Ники всех, кто отмечался со скриптом, запоминаются в moonloader\config\sf_known.txt
+    -- и видны в списке и после перезахода. Кого не было видно дольше known_days дней - забываются.
+    known_days       = 30,
     max_participants = 30,        -- предел участников в одном коде запуска (лимит длины чата)
 
     chat_cmd          = '/fc',       -- чат управления
@@ -179,10 +185,28 @@ local function isOnline(nick)
     return false
 end
 
--- Действующий список лидеров: только из общего списка на GitHub (или встроенный),
--- поэтому назначить себя лидером у себя в игре нельзя.
-local function leaderList()
+-- Лидеры из общего списка на GitHub (или запасные, если списка ещё нет)
+local function rosterLeaders()
     return roster.leaders or CFG.default_leaders
+end
+
+-- Действующий список лидеров: общий список на GitHub + встроенные в скрипт.
+-- Назначить себя лидером у себя в игре нельзя: ни конфиг, ни команды на это не влияют.
+local function leaderList()
+    local out, seen = {}, {}
+    local function add(n)
+        if not seen[norm(n)] then seen[norm(n)] = true; out[#out + 1] = n end
+    end
+    for _, n in ipairs(rosterLeaders()) do add(n) end
+    for _, n in ipairs(CFG.builtin_leaders) do add(n) end
+    return out
+end
+
+local function isBuiltinLeader(nick)
+    for _, n in ipairs(CFG.builtin_leaders) do
+        if norm(n) == norm(nick or '') then return true end
+    end
+    return false
 end
 
 local function isLeader(nick)
@@ -198,7 +222,8 @@ end
 local B36 = '0123456789abcdefghijklmnopqrstuvwxyz'
 
 local function listHash()
-    local s = lower(table.concat(leaderList(), ',') .. '|' .. table.concat(roster.list, ','))
+    -- считается по лидерам из общего списка (без встроенных) - так же, как в старых версиях
+    local s = lower(table.concat(rosterLeaders(), ',') .. '|' .. table.concat(roster.list, ','))
     local h = 7
     for i = 1, #s do h = (h * 31 + s:byte(i)) % 2147483647 end
     local out = ''
@@ -271,25 +296,104 @@ end
 -- ------------------- присутствие (кто со скриптом) -----------------
 -- Заполняется, когда приходит отклик #SF HI или любой служебный код от игрока со скриптом.
 -- Хранится всю сессию: кто отметился и сейчас в сети, тот в списке.
-local presence = {}        -- [норм.ник] = { nick = ник, at = время, ver = версия скрипта или nil }
+--   nl = при последнем ответе на сканирование он не признал сканирующего лидером
+--        (у него старый или не скачанный список лидеров) - код запуска он бы проигнорировал
+local presence = {}        -- [норм.ник] = { nick = ник, at = время, ver = версия или nil, nl = true/false }
 local lastScanInfo = nil   -- { at, count } - результат последнего сканирования
 local lastScanSeenAt = -1000 -- когда в чате последний раз было сканирование от лидера
+local recentScans = {}       -- времена последних сканирований (несколько штук)
 
--- ver - версия из отклика (v2.9+); старые версии её не присылают
-local function recordPresence(nick, ver)
+-- ------------- запомненные ники (между заходами в игру) -------------
+-- Файл moonloader\config\sf_known.txt, строки "ник;версия;когда видели (unix-время)".
+-- Только для списка в меню: в волну по-прежнему идут лишь те, кто ответил на сканирование.
+local known = {}           -- [норм.ник] = { nick = ник, ver = версия или nil, seen = os.time() }
+local knownDirty = false
+local knownSavedAt = -100
+
+local function knownPath()
+    return getWorkingDirectory() .. '\\config\\sf_known.txt'
+end
+
+local function loadKnown()
+    known = {}
+    local f = io.open(knownPath(), 'r')
+    if not f then return end
+    local limit = os.time() - CFG.known_days * 86400
+    for line in f:lines() do
+        local nick, ver, seen = line:match('^%s*([%w%[%]%(%)%$@%._=]+)%s*;%s*([%d%.]*)%s*;%s*(%d+)')
+        seen = tonumber(seen)
+        if nick and seen and seen >= limit then
+            known[norm(nick)] = { nick = nick, ver = ver ~= '' and ver or nil, seen = seen }
+        end
+    end
+    f:close()
+end
+
+local function saveKnown()
+    knownDirty, knownSavedAt = false, os.clock()
+    local list = {}
+    for _, e in pairs(known) do list[#list + 1] = e end
+    table.sort(list, function(a, b) return lower(a.nick) < lower(b.nick) end)
+    local f = io.open(knownPath(), 'w')
+    if not f then return end
+    f:write('; AMARAYTHEN Capter: игроки, у которых видели скрипт (ник;версия;когда). Заполняется само.\n')
+    for _, e in ipairs(list) do f:write(string.format('%s;%s;%d\n', e.nick, e.ver or '', e.seen)) end
+    f:close()
+end
+
+local function rememberNick(nick, ver)
+    local k, t = norm(nick), os.time()
+    local e = known[k]
+    if not e then
+        known[k] = { nick = nick, ver = ver, seen = t }
+        knownDirty = true
+        return
+    end
+    if e.nick ~= nick or (ver and e.ver ~= ver) or t - e.seen > 3600 then knownDirty = true end
+    e.nick, e.seen = nick, t
+    if ver then e.ver = ver end
+end
+
+-- ver - версия из отклика (v2.9+); nl - признак из отклика (v3.0+); nil - оставить как было
+local function recordPresence(nick, ver, nl)
     if not nick or nick == '' then return end
     local k = norm(nick)
     local old = presence[k]
-    presence[k] = { nick = nick, at = os.clock(), ver = ver or (old and old.ver) }
+    if nl == nil then nl = old and old.nl or false end
+    presence[k] = { nick = nick, at = os.clock(), ver = ver or (old and old.ver), nl = nl }
+    rememberNick(nick, ver)
 end
 
 local function presenceOf(nick)
     return presence[norm(nick)]
 end
 
--- Не ответил на последнее сканирование: оно было после его последней отметки, и время на ответ вышло
+-- Сканирование было, и время на ответ уже вышло
+local function scanSettled()
+    return lastScanSeenAt > 0 and os.clock() - lastScanSeenAt > CFG.scan_wait + 1
+end
+
+-- В чате прошло сканирование лидера
+local function noteScan()
+    lastScanSeenAt = os.clock()
+    recentScans[#recentScans + 1] = lastScanSeenAt
+    if #recentScans > 6 then table.remove(recentScans, 1) end
+end
+
+-- Последнее сканирование, время на ответ на которое уже вышло (или -1000, если такого нет).
+-- Пока идёт новое сканирование, судим по предыдущему - так список не мигает.
+local function settledScanAt()
+    local now, best = os.clock(), -1000
+    for _, t in ipairs(recentScans) do
+        if now - t > CFG.scan_wait + 1 and t > best then best = t end
+    end
+    return best
+end
+
+-- Не ответил на последнее завершённое сканирование (отметился раньше него)
 local function missedScan(p)
-    return p.at < lastScanSeenAt and os.clock() - lastScanSeenAt > CFG.scan_wait + 1
+    local at = settledScanAt()
+    return at > 0 and p.at < at
 end
 
 -- Кто сейчас на сервере: [норм.ник] = ID. Один проход по игрокам вместо поиска для каждого ника.
@@ -304,41 +408,68 @@ local function onlineMap()
     return map
 end
 
+local function byNick(a, b) return lower(a) < lower(b) end
+
 -- Другие игроки со скриптом (без меня), которые в сети и отметились не раньше since
--- (по умолчанию - за последние presence_ttl секунд)
-local function presentNicks(map, since)
+-- (по умолчанию - за последние presence_ttl секунд). nlMode: nil - все, 'ok' - только признавшие
+-- лидера (они пойдут в волну), 'nl' - только не признавшие.
+local function presentNicks(map, since, nlMode)
     map = map or onlineMap()
     since = since or (os.clock() - CFG.presence_ttl)
     local out = {}
     local me = myNick()
     for _, p in pairs(presence) do
         local isMe = me and norm(p.nick) == norm(me)
-        if not isMe and p.at >= since and map[norm(p.nick)] then out[#out + 1] = p.nick end
+        local fits = nlMode == nil or (nlMode == 'ok' and not p.nl) or (nlMode == 'nl' and p.nl)
+        if not isMe and fits and p.at >= since and map[norm(p.nick)] then out[#out + 1] = p.nick end
     end
-    table.sort(out, function(a, b) return lower(a) < lower(b) end)
+    table.sort(out, byNick)
     return out
 end
 
--- Для списка в меню: все, кто отмечался в этой сессии и сейчас в сети (без меня).
--- Возвращает два списка: на связи и не ответившие на последнее сканирование.
+-- Для списка в меню: все известные игроки со скриптом (кроме меня), разложенные по состоянию:
+--   live    - в сети и на связи;
+--   nl      - в сети, ответили, но не признали лидера (старый/не скачанный список лидеров);
+--   missed  - в сети, но не ответили на последнее сканирование;
+--   waiting - в сети, известны с прошлых заходов, в этой сессии ещё не отмечались и сканирования не было;
+--   offline - не в сети (по последнему разу, когда видели).
 local function knownNicks(map)
     map = map or onlineMap()
-    local live, missed = {}, {}
+    local r = { live = {}, nl = {}, missed = {}, waiting = {}, offline = {} }
     local me = myNick()
-    for _, p in pairs(presence) do
-        local isMe = me and norm(p.nick) == norm(me)
-        if not isMe and map[norm(p.nick)] then
-            if missedScan(p) then missed[#missed + 1] = p.nick else live[#live + 1] = p.nick end
+    local seen = {}
+    local function put(nick, key)
+        local k = norm(nick)
+        if seen[k] or (me and k == norm(me)) then return end
+        seen[k] = true
+        if not map[k] then
+            r.offline[#r.offline + 1] = nick
+            return
+        end
+        local p = presence[k]
+        if p then
+            if missedScan(p) then r.missed[#r.missed + 1] = nick
+            elseif p.nl then r.nl[#r.nl + 1] = nick
+            else r.live[#r.live + 1] = nick end
+        elseif settledScanAt() > 0 then
+            r.missed[#r.missed + 1] = nick
+        else
+            r.waiting[#r.waiting + 1] = nick
         end
     end
-    local function byNick(a, b) return lower(a) < lower(b) end
-    table.sort(live, byNick)
-    table.sort(missed, byNick)
-    return live, missed
+    for _, p in pairs(presence) do put(p.nick) end
+    for _, e in pairs(known) do put(e.nick) end
+    for _, key in ipairs{ 'live', 'nl', 'missed', 'waiting' } do table.sort(r[key], byNick) end
+    -- не в сети: сначала те, кого видели недавно
+    table.sort(r.offline, function(a, b)
+        local ea, eb = known[norm(a)], known[norm(b)]
+        return (ea and ea.seen or 0) > (eb and eb.seen or 0)
+    end)
+    return r
 end
 
 -- Игроки из списка состава на GitHub, которые в сети, но не отметились (с момента since, если задан):
--- у них нет скрипта, он старый, не скачался список лидеров или отклик не дошёл
+-- у них нет скрипта, он старый или отклик не дошёл. Без since - только те, кого скрипт ни разу не видел.
 local function silentRosterNicks(map, since)
     map = map or onlineMap()
     local out = {}
@@ -346,7 +477,9 @@ local function silentRosterNicks(map, since)
     for _, n in ipairs(roster.list) do
         local isMe = me and norm(n) == norm(me)
         local p = presenceOf(n)
-        local answered = p and (not since or p.at >= since)
+        local answered
+        if since then answered = p and p.at >= since
+        else answered = p or known[norm(n)] end
         if not isMe and not answered and map[norm(n)] then out[#out + 1] = n end
     end
     return out
@@ -354,7 +487,7 @@ end
 
 -- Ник с версией скрипта для чата: "Nick_Name 2.9" (версию присылают только v2.9+)
 local function nickWithVer(nick)
-    local p = presenceOf(nick)
+    local p = presenceOf(nick) or known[norm(nick)]
     return (p and p.ver) and (nick .. ' ' .. p.ver) or nick
 end
 
@@ -376,17 +509,22 @@ end
 -- Итог сканирования в чат лидеру: кто отозвался (с версиями) и кто из списка состава молчит
 local function scanReport(since)
     local map = onlineMap()
-    local present = presentNicks(map, since)
+    local present = presentNicks(map, since, 'ok')
     msg(string.format('Со скриптом в сети: %d (включая тебя).', #present + 1))
     if #present > 0 then
         local labels = {}
         for i, n in ipairs(present) do labels[i] = nickWithVer(n) end
         msgNicks('Отозвались:', labels)
     end
+    local nl = presentNicks(map, since, 'nl')
+    if #nl > 0 then
+        msgNicks(string.format('{FFB040}Скрипт есть, но тебя лидером не видят (%d):{CFCFCF}', #nl), nl)
+        msg('У них не скачался список лидеров с GitHub - в волну не попадут. Пусть наберут /ac reload.')
+    end
     local silent = silentRosterNicks(map, since)
     if #silent > 0 then
         msgNicks(string.format('{FFB040}Из списка состава в сети, но молчат (%d):{CFCFCF}', #silent), silent)
-        msg('Причины: нет скрипта, версия старее 2.4 или у них не скачался список лидеров с GitHub.')
+        msg('Причины: нет скрипта, свёрнута игра или версия до 3.0 без списка лидеров с GitHub.')
         msg('Проверь у них /ac - вкладка «Лидеры»: если тебя там нет, дело в списке.')
     end
     return #present + 1
@@ -408,7 +546,7 @@ local function buildParticipantIds(since)
     local ids, seen = {}, {}
     local function add(id) if id and not seen[id] then seen[id] = true; ids[#ids + 1] = id end end
     add(myId())
-    for _, nick in ipairs(presentNicks(nil, since)) do add(idByNick(nick)) end
+    for _, nick in ipairs(presentNicks(nil, since, 'ok')) do add(idByNick(nick)) end
     table.sort(ids)
     local trimmed = false
     if #ids > CFG.max_participants then
@@ -567,17 +705,26 @@ local hiPending = false    -- отклик запланирован, но ещё не отправлен
 local hiPendingAt = -100
 local hiEchoAt = -100      -- когда мой отклик последний раз вернулся из чата
 local hiFailNoticeAt = -100
+-- Если сканирующего я лидером не признаю (мой список лидеров старый или не скачался), отвечаю с меткой NL:
+-- лидер увидит, что скрипт у меня есть, но в волну меня не возьмёт - его код запуска я бы проигнорировал.
+-- Признаю или нет - решается в момент отправки (список мог успеть обновиться за время разброса).
+local lastReplyNl = false
+local lastReplySentAt = -100
 local function replyPresence(leader)   -- leader = nil: отметка при входе в игру
     if hiPending and os.clock() - hiPendingAt < 5 then return end
     hiPending, hiPendingAt = true, os.clock()
-    local line = string.format('%s %s HI %s', CFG.chat_cmd, CFG.code_prefix, thisScript().version)
     lua_thread.create(function()
         wait(math.random(0, math.floor(CFG.hi_jitter * 1000)))
         for try = 1, CFG.hi_tries do
             if os.clock() - state.lastSendAt < CFG.chat_pause then wait(math.floor(CFG.chat_pause * 1000)) end
+            local nl = leader ~= nil and not isLeader(leader)
+            lastReplyNl, lastReplySentAt = nl, os.clock()
+            local line = string.format('%s %s HI %s%s', CFG.chat_cmd, CFG.code_prefix, thisScript().version,
+                nl and ' NL' or '')
             local sentAt = os.clock()
             state.lastSendAt = sentAt
-            dbg(string.format('%s, попытка %d', leader and ('отклик на сканирование ' .. leader) or 'отметка при входе', try))
+            dbg(string.format('%s%s, попытка %d', leader and ('отклик на сканирование ' .. leader) or 'отметка при входе',
+                nl and ' (лидером не признаю)' or '', try))
             sampSendChat(line)
             hiPending = false
             while os.clock() - sentAt < CFG.hi_confirm and hiEchoAt < sentAt do wait(50) end
@@ -603,6 +750,7 @@ end
 -- а к волне подключаемся с учётом времени, ушедшего на загрузку.
 local lastForeignCatchUp = -100
 local lastSyncAt = -100
+local lastNlReplyAt = -100
 
 -- Код от того, кого нет в моих лидерах, а свежий список не скачался - проверить его нельзя.
 -- Говорю об этом вслух (не чаще раза в минуту), иначе игрок не поймёт, почему не участвует.
@@ -666,14 +814,17 @@ local function handleCode(clean, codePos)
     local me = myNick()
     local fromMe = me and norm(me) == norm(sender)
 
-    -- #SF HI [версия] - отклик на сканирование (v2.9+ добавляют свою версию)
-    local isHi, hiVer = rest:match('^%s+(HI)%s*([%d%.]*)')
+    -- #SF HI [версия] [NL] - отклик на сканирование или отметка при входе
+    -- (v2.9+ добавляют свою версию, v3.0+ - метку NL, если не признают сканирующего лидером)
+    local isHi, hiVer, hiFlag = rest:match('^%s+(HI)%s*([%d%.]*)%s*(%a*)')
 
     -- любой служебный код подтверждает: этот игрок со скриптом (свои сообщения не считаем)
     if fromMe then
         if isHi then hiEchoAt = os.clock() end
+    elseif isHi then
+        recordPresence(sender, hiVer ~= '' and hiVer or nil, hiFlag == 'NL')
     else
-        recordPresence(sender, (isHi and hiVer ~= '') and hiVer or nil)
+        recordPresence(sender)
     end
     if isHi then return true end
 
@@ -714,21 +865,30 @@ local function handleCode(clean, codePos)
     end
 
     -- #SF SCAN от того, кого нет в моих лидерах: возможно, его только что сделали лидером,
-    -- а мой список устарел. Сверяюсь с GitHub (не чаще раза в 10 с) и, если он лидер, откликаюсь.
+    -- а мой список устарел. Отвечаю сразу (не чаще раза в 20 с) - пока не признаю, с меткой NL, -
+    -- и параллельно сверяюсь с GitHub (не чаще раза в 10 с). Если он лидер - отвечаю уже как участник.
     if rest:match('^%s+SCAN') and not isLeader(sender) then
-        if os.clock() - lastForeignCatchUp < 10 then return false end
-        lastForeignCatchUp = os.clock()
-        dbg('сканирование от ' .. sender .. ', его нет в моих лидерах - проверяю общий список')
-        loadRemoteRoster(false, function(ok)
-            if isLeader(sender) then
-                if not fromMe then replyPresence(sender) end
-            elseif not ok then
-                listFailedNotice(sender, 'просит отклик')
-            else
-                dbg('после обновления ' .. sender .. ' всё равно не лидер - не отвечаю')
-            end
-        end)
-        return false
+        if fromMe then return false end
+        local scanAt = os.clock()
+        if os.clock() - lastNlReplyAt >= 20 then
+            lastNlReplyAt = os.clock()
+            replyPresence(sender)
+        end
+        if os.clock() - lastForeignCatchUp >= 10 then
+            lastForeignCatchUp = os.clock()
+            dbg('сканирование от ' .. sender .. ', его нет в моих лидерах - проверяю общий список')
+            loadRemoteRoster(false, function(ok)
+                if isLeader(sender) then
+                    -- ответ ещё ждёт отправки - уйдёт уже без NL; ушёл с NL или не уходил - отвечаю заново
+                    if not hiPending and (lastReplyNl or lastReplySentAt < scanAt) then replyPresence(sender) end
+                elseif not ok then
+                    listFailedNotice(sender, 'просит отклик')
+                else
+                    dbg('после обновления ' .. sender .. ' всё равно не лидер')
+                end
+            end)
+        end
+        return true
     end
 
     if not isLeader(sender) then
@@ -737,7 +897,7 @@ local function handleCode(clean, codePos)
     end
     -- #SF SCAN - лидер спрашивает, кто со скриптом в сети; откликаюсь, если это не я
     if rest:match('^%s+SCAN') then
-        lastScanSeenAt = os.clock()
+        noteScan()
         if fromMe then confirmOutbox('SCAN') else replyPresence(sender) end
         return true
     end
@@ -1113,20 +1273,38 @@ local function decodeContentsJson(json)
 end
 
 -- Свежий файл из репозитория: cb(содержимое или nil, 'api' | 'raw')
-local function fetchRepoFile(path, timeoutMs, cb)
+-- Откуда берётся файл: 1) API GitHub (свежий, но лимит 60 запросов в час на IP);
+-- 2) прямая ссылка raw.githubusercontent.com (кэш до 5 минут, у некоторых провайдеров заблокирована);
+-- 3) зеркало jsDelivr (cdn.jsdelivr.net) - открывается, когда GitHub недоступен, но может отставать на часы.
+-- isValid(содержимое) - проверка, что пришёл нужный файл, а не страница ошибки или блокировки.
+local function fetchRepoFile(path, timeoutMs, cb, isValid)
     local g, t = CFG.github, os.time()
     local api = string.format('https://api.github.com/repos/%s/%s/contents/%s?ref=%s&t=%d',
         g.owner, g.repo, path, g.branch, t)
     local raw = string.format('https://raw.githubusercontent.com/%s/%s/%s/%s?nocache=%d',
         g.owner, g.repo, g.branch, path, t)
+    local cdn = string.format('https://cdn.jsdelivr.net/gh/%s/%s@%s/%s',
+        g.owner, g.repo, g.branch, path)
+    local function good(content)
+        return content and (not isValid or isValid(content))
+    end
     httpGet(api, timeoutMs, function(json)
         local data = json and decodeContentsJson(json)
-        if data then
+        if good(data) then
             cb(data, 'api')
             return
         end
         dbg('API GitHub не ответил для ' .. path .. ', беру по прямой ссылке')
-        httpGet(raw, timeoutMs, function(content) cb(content, 'raw') end)
+        httpGet(raw, timeoutMs, function(content)
+            if good(content) then
+                cb(content, 'raw')
+                return
+            end
+            dbg('прямая ссылка GitHub не ответила для ' .. path .. ', беру с зеркала jsDelivr')
+            httpGet(cdn, timeoutMs, function(mirror)
+                if good(mirror) then cb(mirror, 'cdn') else cb(content or mirror, 'raw') end
+            end)
+        end)
     end)
 end
 
@@ -1157,6 +1335,11 @@ loadRemoteRoster = function(verbose, onDone, timeoutMs)
         local ok, text = false, nil
         local ver, list, leaders
         if content then ver, list, leaders = parseRoster(content) end
+        -- зеркало может отставать: более старую версию списка, чем уже сохранённая, не берём
+        if source == 'cdn' and ver and ver < roster.version then
+            dbg(string.format('зеркало отдало старый список v%d, оставляю сохранённый v%d', ver, roster.version))
+            content, ver = nil, nil
+        end
         if not content then
             text = '{FF6060}Общий список не скачался, оставлен сохранённый. Проверь интернет.'
         elseif not ver then
@@ -1181,7 +1364,7 @@ loadRemoteRoster = function(verbose, onDone, timeoutMs)
         for _, w in ipairs(waiters) do
             if w.onDone then w.onDone(ok) end
         end
-    end)
+    end, function(c) return parseRoster(c) ~= nil end)
 end
 
 -- ------------------------- автообновление --------------------------
@@ -1268,6 +1451,9 @@ local function checkForUpdate(verbose)
         update.pending = { content = content, version = newVersion }
         finish(string.format('Найдено обновление v%s.%s', newVersion,
             state.phase ~= 'idle' and ' Установлю после флуда.' or ''))
+    end, function(c)
+        return c:match("script_version%(%s*'[^']+'%s*%)") ~= nil
+            and (c:find("script_name('AMARAYTHEN Capter')", 1, true) or c:find("script_name('SF Capture')", 1, true)) ~= nil
     end)
 end
 
@@ -1305,6 +1491,10 @@ local function finalizeAutoLaunch()
         -- На GitHub-список не откатываемся автоматически: там могут быть без скрипта, волна с дырами.
         -- Запасной режим включается вручную - выключить автоопределение в настройках.
         msg('Со скриптом в сети больше никого не отозвалось, запускаю один.')
+    end
+    local nl = presentNicks(nil, p.since, 'nl')
+    if #nl > 0 then
+        msgNicks(string.format('{FFB040}Не видят тебя лидером (нет списка с GitHub), в волне не будут (%d):{CFCFCF}', #nl), nl)
     end
     local silent = silentRosterNicks(nil, p.since)
     if #silent > 0 then
@@ -1451,9 +1641,9 @@ if hasImgui then
         dirty     = false,
         online    = {},       -- [норм.ник] = ID, кто сейчас на сервере
         onlineAt  = -1,
-        present   = {},       -- другие со скриптом, на связи
-        missed    = {},       -- отмечались, но не ответили на последнее сканирование
-        silent    = {},       -- из списка состава в сети, но ни разу не отметились
+        present   = {},       -- другие со скриптом, на связи (пойдут в волну)
+        groups    = { live = {}, nl = {}, missed = {}, waiting = {}, offline = {} },
+        silent    = {},       -- из списка состава в сети, но скрипт их ни разу не видел
         notice    = nil,
         noticeErr = false,
         noticeAt  = 0,
@@ -1492,7 +1682,8 @@ if hasImgui then
         if now - ui.onlineAt < 0.5 then return end
         ui.onlineAt = now
         ui.online  = onlineMap()
-        ui.present, ui.missed = knownNicks(ui.online)
+        ui.groups  = knownNicks(ui.online)
+        ui.present = ui.groups.live
         ui.silent  = silentRosterNicks(ui.online)
     end
 
@@ -1962,11 +2153,12 @@ if hasImgui then
         local leader = isLeader(me or '')
 
         if CFG.auto_discovery then
-            local present, missed, silent = ui.present, ui.missed, ui.silent
-            local n = #present + 1
-            drawListHeader('Со скриптом в сети', n, n, string.format('%d со скриптом', n))
-            mutedWrapped('Игроки со скриптом попадают сюда сами, когда заходят в игру. ' ..
-                'Перед запуском лидер ещё раз проверяет всех: в волну идут только ответившие.')
+            local g, silent = ui.groups, ui.silent
+            local onlineCount = 1 + #g.live + #g.nl + #g.missed + #g.waiting
+            drawListHeader('Со скриптом', onlineCount, onlineCount + #g.offline,
+                string.format('в сети %d из %d', onlineCount, onlineCount + #g.offline))
+            mutedWrapped('Сюда сами попадают все, у кого стоит скрипт, и запоминаются. ' ..
+                'В волну идут только ответившие на сканирование перед запуском.')
             local info
             if lastScanSeenAt < 0 then
                 info = 'сканирования в этой сессии ещё не было'
@@ -1981,23 +2173,38 @@ if hasImgui then
                 end
             end
             imgui.TextDisabled(u8(info))
-            local grey = #missed + #silent
-            if grey > 0 then
-                wrappedColored(C_ACCENT, string.format('Серые (%d) - в сети, но не на связи: нет скрипта, ' ..
-                    'версия старее 2.4 или у них не скачался список лидеров.', grey))
+            local listH = 296
+            if #g.nl > 0 then
+                wrappedColored(C_ACCENT, '«не видит лидера» - у игрока не скачался список лидеров с GitHub, ' ..
+                    'в волну он не попадёт. Пусть наберёт /ac reload.')
+                listH = listH - 40
+            end
+            if #g.missed + #silent > 0 then
+                mutedWrapped('«не ответил» / «не отмечался» - в сети, но молчит: свёрнута игра, ' ..
+                    'нет скрипта или старая версия.')
+                listH = listH - 40
             end
             imgui.Dummy(V2(0, 2))
-            -- я + на связи, затем не ответившие на сканирование, затем молчащие из списка состава
+            -- я, на связи, не видят лидера, молчат, проверяются, молчащие из списка состава, не в сети
             local shown, tag = { me or '?' }, {}
-            for _, x in ipairs(present) do shown[#shown + 1] = x end
-            for _, x in ipairs(missed) do shown[#shown + 1] = x; tag[norm(x)] = 'не ответил' end
-            for _, x in ipairs(silent) do shown[#shown + 1] = x; tag[norm(x)] = 'не отмечался' end
+            local function add(list, t, color, muted)
+                for _, x in ipairs(list) do
+                    shown[#shown + 1] = x
+                    if t then tag[norm(x)] = { t, color, muted } end
+                end
+            end
+            add(g.live)
+            add(g.nl, 'не видит лидера', C_ACCENT, false)
+            add(g.missed, 'не ответил', C_MUTED, true)
+            add(g.waiting, 'проверяется', C_MUTED, true)
+            add(silent, 'не отмечался', C_MUTED, true)
+            add(g.offline, 'не в сети', C_MUTED, true)
             local myVer = thisScript().version
-            drawNickRows(shown, me, 'Пока никто не отметился.', grey > 0 and 256 or 296, function(x)
+            drawNickRows(shown, me, 'Пока никто не отметился.', math.max(160, listH), function(x)
                 local t = tag[norm(x)]
-                if t then return { muted = true, badges = { { t, C_MUTED } } } end
+                if t then return { muted = t[3], badges = { { t[1], t[2] } } } end
                 local isMe = me and norm(x) == norm(me)
-                local pr = presenceOf(x)
+                local pr = presenceOf(x) or known[norm(x)]
                 local ver = isMe and myVer or (pr and pr.ver)
                 if ver then
                     return { badges = { { 'v' .. ver, isNewerVersion(myVer, ver) and C_ACCENT or C_MUTED } } }
@@ -2058,8 +2265,22 @@ if hasImgui then
         for _, n in ipairs(list) do if ui.online[norm(n)] then on = on + 1 end end
         drawListHeader('Лидеры', on, #list)
         mutedWrapped('Только лидеры могут запускать и останавливать флуд. Список задаётся руководством состава.')
+        local h = 360
+        if rosterBusy() then
+            imgui.TextDisabled(u8'список лидеров обновляется...')
+            h = h - 22
+        elseif roster.fetchedAt then
+            local m = math.floor((os.clock() - roster.fetchedAt) / 60)
+            imgui.TextDisabled(u8(m < 1 and 'список с GitHub обновлён только что'
+                or string.format('список с GitHub обновлён %d мин назад', m)))
+            h = h - 22
+        else
+            wrappedColored(C_ACCENT, 'GitHub у тебя сейчас не открывается: видны только встроенные лидеры ' ..
+                'и сохранённая копия списка. Проверь интернет или попробуй VPN, потом /ac reload.')
+            h = h - 62
+        end
         imgui.Dummy(V2(0, 2))
-        drawNickRows(list, me, 'Лидеров нет.', 360)
+        drawNickRows(list, me, 'Лидеров нет.', h)
     end
 
     local function drawSettingsTab()
@@ -2299,6 +2520,16 @@ local function cmdSf(arg)
             line = line == '' and item or (line .. ', ' .. item)
         end
         if line ~= '' then msg(line) end
+        if CFG.auto_discovery then
+            local g = knownNicks()
+            local on = {}
+            for _, n in ipairs(g.live) do on[#on + 1] = nickWithVer(n) end
+            for _, n in ipairs(g.nl) do on[#on + 1] = n .. ' (не видит лидера)' end
+            for _, n in ipairs(g.missed) do on[#on + 1] = n .. ' (не ответил)' end
+            for _, n in ipairs(g.waiting) do on[#on + 1] = nickWithVer(n) end
+            msgNicks(string.format('Со скриптом в сети (%d):', #on), on)
+            if #g.offline > 0 then msgNicks(string.format('Со скриптом, не в сети (%d):', #g.offline), g.offline) end
+        end
 
     elseif cmd == 'reload' then
         reloadAll()
@@ -2383,6 +2614,7 @@ function main()
     trace('старт v' .. thisScript().version)
     sampRegisterChatCommand('ac', cmdSf)
     loadConfig(false)
+    loadKnown()
     if roster.version > 0 then
         msg(string.format('v%s загружен. Общий список v%d (%d ников, лидеров %d), проверяю обновления...',
             thisScript().version, roster.version, #roster.list, #leaderList()))
@@ -2416,6 +2648,9 @@ function main()
                 if not ok then print('[AMARAYTHEN] ошибка действия «' .. a.name .. '»: ' .. tostring(err)) end
             end
         end
+
+        -- запомненные ники пишутся на диск не чаще раза в 20 с
+        if knownDirty and now - knownSavedAt > 20 then saveKnown() end
 
         -- при входе в игру (один раз за запуск скрипта): участник отмечается в чате,
         -- лидер сканирует - так игроки со скриптом сами появляются в списке у лидеров
