@@ -1,6 +1,6 @@
 script_name('AMARAYTHEN Capter')
 script_author('amaru')
-script_version('2.5')
+script_version('2.7')
 script_description('AMARAYTHEN Capter by amaru: синхронный флуд /capture волной. Запуск лидером через /fc.')
 -- Совместимость с автообновлением v1.8-v1.9, которые ищут в новом файле прежнее имя.
 -- Не удалять: script_name('SF Capture')
@@ -30,7 +30,7 @@ local CFG = {
     github          = { owner = 'amaru1918', repo = 'sf-roster', branch = 'main' },
     roster_path     = 'sf_roster.txt',
     script_path     = 'sf_capture.lua',
-    roster_refresh  = 180,        -- как часто перепроверять список, с (когда нет флуда)
+    roster_refresh  = 600,        -- как часто перепроверять список, с (когда нет флуда); реже - бережём лимит API GitHub
     sync_cooldown   = 5,          -- не чаще раза в N секунд выполнять «обновить у всех»
     -- Лидеры, пока общий список ещё ни разу не скачан или в нём нет секции [leaders].
     default_leaders = { 'Escay_Eastwood' },
@@ -131,7 +131,22 @@ local function dbg(text)
     print('[debug] ' .. text)
 end
 
+-- Короткие отметки о ключевых шагах в moonloader.log: если игра упадёт,
+-- по последним строкам лога будет видно, на каком шаге это случилось.
+local function trace(text)
+    print('[trace] ' .. text)
+end
+
+-- Свой персонаж уже в игре? До спавна функции SAMPFUNCS для своего игрока
+-- небезопасны, поэтому ник/ID/пинг до этого не запрашиваются.
+local function localReady()
+    if not isSampAvailable() then return false end
+    if sampIsLocalPlayerSpawned and not sampIsLocalPlayerSpawned() then return false end
+    return true
+end
+
 local function myNick()
+    if not localReady() then return nil end
     local ok, id = sampGetPlayerIdByCharHandle(PLAYER_PED)
     if not ok then return nil end
     return sampGetPlayerNickname(id)
@@ -139,6 +154,7 @@ end
 
 -- Свой пинг до сервера, мс (туда и обратно)
 local function myPing()
+    if not localReady() then return 0 end
     local ok, id = sampGetPlayerIdByCharHandle(PLAYER_PED)
     if not ok then return 0 end
     local p = tonumber(sampGetPlayerPing(id)) or 0
@@ -242,6 +258,7 @@ end
 
 -- Мой игровой ID на сервере
 local function myId()
+    if not localReady() then return nil end
     local ok, id = sampGetPlayerIdByCharHandle(PLAYER_PED)
     return ok and id or nil
 end
@@ -550,6 +567,18 @@ local function handleCode(clean, codePos)
         return true
     end
 
+    -- #SF SCAN от того, кого нет в моих лидерах: возможно, его только что сделали лидером,
+    -- а мой список устарел. Сверяюсь с GitHub (не чаще раза в 10 с) и, если он лидер, откликаюсь.
+    if rest:match('^%s+SCAN') and not isLeader(sender) then
+        if os.clock() - lastForeignCatchUp < 10 then return false end
+        lastForeignCatchUp = os.clock()
+        dbg('сканирование от ' .. sender .. ', его нет в моих лидерах - проверяю общий список')
+        loadRemoteRoster(false, function()
+            if isLeader(sender) and not fromMe then replyPresence() end
+        end)
+        return false
+    end
+
     if not isLeader(sender) then
         dbg('код от ' .. sender .. ', он не в списке лидеров - игнор')
         return false
@@ -793,60 +822,105 @@ local function fileSize(path)
     return size
 end
 
--- Скачивает url, вызывает cb(содержимое) или cb(nil) при ошибке или по таймауту.
--- Сигнал STATUS_ENDDOWNLOADDATA приходит, когда данные получены, но Windows может ещё
--- дописывать файл на диск - большие файлы тогда читались обрезанными. Поэтому файл читается
--- по окончательному сигналу MoonLoader STATUSEX_ENDDOWNLOAD, а если его нет - когда размер
--- файла перестал меняться.
+-- Скачивание через downloadUrlToFile. Правила, которые здесь соблюдаются:
+-- 1) Сигнал STATUS_ENDDOWNLOADDATA приходит, когда данные получены, но Windows может ещё
+--    дописывать файл на диск. Файл читается по окончательному сигналу STATUSEX_ENDDOWNLOAD,
+--    а если его нет - когда размер файла перестал меняться.
+-- 2) Из обработчика загрузки нельзя запускать новую загрузку («device or resource busy»),
+--    поэтому обработчик только ставит отметки.
+-- 3) Загрузку нельзя запускать из временного потока lua_thread: поток завершится раньше
+--    загрузки, и сообщение о её окончании придёт в уже несуществующий поток (падение игры).
+--    Поэтому httpGet только ставит запрос в очередь, а запускает загрузки, следит за ними
+--    и вызывает обработчики результата главный цикл скрипта (pollDownloads).
+local dlQueue  = {}   -- запросы, ждущие запуска
+local dlActive = {}   -- идущие загрузки
+
+-- Скачивает url, потом вызывает cb(содержимое) или cb(nil) при ошибке или по таймауту
 local function httpGet(url, timeoutMs, cb)
+    dlQueue[#dlQueue + 1] = { url = url, timeoutMs = timeoutMs, cb = cb }
+end
+
+local function readWholeFile(path)
+    local f = io.open(path, 'rb')
+    local content = f and f:read('*a')
+    if f then f:close() end
+    return (content and content ~= '') and content or nil
+end
+
+local function finishDownload(d, content)
+    if d.done then return end
+    d.done = true
+    d.cleanupAt = os.clock() + 30
+    os.remove(d.path)
+    trace(string.format('загрузка %d: %s', d.seq, content and (#content .. ' байт') or 'нет данных'))
+    -- ошибка в обработке ответа не должна «убивать» весь скрипт
+    local ok, err = pcall(d.cb, content)
+    if not ok then
+        print('[AMARAYTHEN] ошибка при обработке загрузки: ' .. tostring(err))
+        dbg('ошибка при обработке загрузки: ' .. tostring(err))
+    end
+end
+
+local function startDownload(req)
     httpSeq = httpSeq + 1
     local dir = getWorkingDirectory() .. '\\config'
     if not doesDirectoryExist(dir) then createDirectory(dir) end
-    local path = string.format('%s\\sf_download_%d.tmp', dir, httpSeq)
-    os.remove(path)
+    local d = {
+        seq = httpSeq, cb = req.cb, done = false,
+        path = string.format('%s\\sf_download_%d.tmp', dir, httpSeq),
+        st = { dataEnded = false, fullyEnded = false },
+        deadline = os.clock() + req.timeoutMs / 1000,
+        last = -1, stable = 0, nextPoll = 0,
+    }
+    os.remove(d.path)
     local EX_END = dlstatus.STATUSEX_ENDDOWNLOAD
-    local done, dataEnded, fullyEnded = false, false, false
-
-    local function finish(content)
-        if done then return end
-        done = true
-        os.remove(path)
-        cb(content)
-    end
-    local function readNow()
-        if done then return end
-        local f = io.open(path, 'rb')
-        local content = f and f:read('*a')
-        if f then f:close() end
-        finish((content and content ~= '') and content or nil)
-    end
-
-    downloadUrlToFile(url, path, function(id, status)
+    local st = d.st
+    trace(string.format('загрузка %d: %s', d.seq, req.url:match('^https://([^/]+)') or '?'))
+    local ok, err = pcall(downloadUrlToFile, req.url, d.path, function(id, status)
         if EX_END and status == EX_END then
-            fullyEnded = true
-            if done then os.remove(path) else readNow() end
+            st.fullyEnded = true
         elseif status == dlstatus.STATUS_ENDDOWNLOADDATA then
-            dataEnded = true
+            st.dataEnded = true
         end
     end)
+    dlActive[#dlActive + 1] = d
+    if not ok then
+        print('[AMARAYTHEN] не удалось начать загрузку: ' .. tostring(err))
+        finishDownload(d, nil)
+    end
+end
 
-    lua_thread.create(function()
-        local deadline = os.clock() + timeoutMs / 1000
-        local last, stable = -1, 0
-        -- со STATUSEX_ENDDOWNLOAD ждём его (но не дольше ~1.5 с после конца данных),
-        -- без него - пока размер файла не меняется целую секунду
-        local need = EX_END and 15 or 10
-        while not done and os.clock() < deadline do
-            wait(100)
-            if dataEnded and not fullyEnded and not done then
-                local size = fileSize(path)
-                if size and size > 0 and size == last then stable = stable + 1 else stable = 0 end
-                last = size or -1
-                if stable >= need then readNow() end
+-- Вызывается из главного цикла каждый кадр
+local function pollDownloads(now)
+    -- запуск новых (обработчики результатов могли добавить запросы - они стартуют в следующий раз)
+    local pending = dlQueue
+    dlQueue = {}
+    for _, req in ipairs(pending) do startDownload(req) end
+
+    -- со STATUSEX_ENDDOWNLOAD ждём его (но не дольше ~1.5 с после конца данных),
+    -- без него - пока размер файла не меняется целую секунду (проверка раз в 50 мс)
+    local need = dlstatus.STATUSEX_ENDDOWNLOAD and 30 or 20
+    for i = #dlActive, 1, -1 do
+        local d = dlActive[i]
+        if not d.done then
+            if d.st.fullyEnded then
+                finishDownload(d, readWholeFile(d.path))
+            elseif now >= d.deadline then
+                finishDownload(d, nil)
+            elseif d.st.dataEnded and now >= d.nextPoll then
+                d.nextPoll = now + 0.05
+                local size = fileSize(d.path)
+                if size and size > 0 and size == d.last then d.stable = d.stable + 1 else d.stable = 0 end
+                d.last = size or -1
+                if d.stable >= need then finishDownload(d, readWholeFile(d.path)) end
             end
         end
-        finish(nil)
-    end)
+        -- загрузка, оборванная по таймауту, может дописать файл позже - убираем его
+        if d.done and (d.st.fullyEnded or now >= d.cleanupAt) then
+            os.remove(d.path)
+            table.remove(dlActive, i)
+        end
+    end
 end
 
 local B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
@@ -1175,6 +1249,15 @@ local function reloadAll()
 end
 
 -- ------------------------------ меню -------------------------------
+-- Кнопки меню не выполняют действия сразу (окно рисуется внутри отрисовки игры), а ставят
+-- их в очередь; главный цикл выполняет их в своём обычном порядке.
+local startMenuTrace = function() end   -- заполняется в блоке меню
+
+local uiActions = {}
+local function uiDo(name, fn)
+    uiActions[#uiActions + 1] = { name = name, fn = fn }
+end
+
 local ui
 if hasImgui then
     local new = imgui.new
@@ -1282,6 +1365,21 @@ if hasImgui then
         end
         loadConfig(false)
         setNotice('Сохранено.')
+    end
+
+    -- Отметки первых кадров после открытия меню - в отдельный файл, с записью на диск сразу:
+    -- если игра упадёт, по последней строке будет видно, на каком шаге отрисовки.
+    local markFrames, markPath = 0, nil
+    local function mark(step)
+        if markFrames <= 0 or not markPath then return end
+        local f = io.open(markPath, 'a')
+        if f then f:write(string.format('%.3f %s\n', os.clock(), step)) f:close() end
+    end
+    startMenuTrace = function()
+        markPath = getWorkingDirectory() .. '\\config\\sf_trace.txt'
+        local f = io.open(markPath, 'w')
+        if f then f:write('v' .. thisScript().version .. ' - открытие меню\n') f:close() end
+        markFrames = 3
     end
 
     local TABS = { 'Запуск', 'Список', 'Лидеры', 'Настройки' }
@@ -1518,7 +1616,9 @@ if hasImgui then
 
     -- ----------------------------- вкладки -----------------------------
     local function drawLaunchTab()
+        mark('запуск: онлайн')
         refreshOnline()
+        mark('запуск: ник')
         local me = myNick() or '?'
         local leader = isLeader(me)
         local W = contentWidth()
@@ -1527,12 +1627,14 @@ if hasImgui then
         withFont(F.bold, function() imgui.Text(me) end)
         imgui.SameLine(0, 10)
         pill(u8(leader and 'ЛИДЕР' or 'УЧАСТНИК'), leader and C_ACCENT or C_MUTED, false)
+        mark('запуск: пинг')
         local ptxt = u8(string.format('пинг %d мс', myPing()))
         imgui.SameLine(imgui.GetWindowWidth() - PAD - imgui.CalcTextSize(ptxt).x)
         imgui.TextDisabled(ptxt)
         imgui.Dummy(V2(0, 2))
 
         -- карточки
+        mark('запуск: карточки')
         local active, slot = rosterOnline(me)
         local cw = (W - 16) / 3
         statCard('##st1', 'В СЕТИ', string.format('%d / %d', active, #roster.list),
@@ -1544,6 +1646,7 @@ if hasImgui then
         imgui.Dummy(V2(0, 2))
 
         -- что происходит сейчас
+        mark('запуск: состояние')
         if state.phase == 'countdown' then
             local left = math.max(0, state.startAt - os.clock())
             local total = math.max(0.001, state.startAt - state.codeAt)
@@ -1565,6 +1668,7 @@ if hasImgui then
         end
         imgui.Dummy(V2(0, 2))
 
+        mark('запуск: панель')
         local fh = imgui.GetFrameHeightWithSpacing()
         local th = imgui.GetTextLineHeightWithSpacing()
         if leader then
@@ -1586,11 +1690,12 @@ if hasImgui then
             local bw = (W - 28 - 8) / 2
             glowRect(imgui.GetCursorScreenPos(), bw, 42, C_ACCENT, 7, 1)
             if colorButton(u8'ЗАПУСТИТЬ', bw, 42, C_ACCENT, C_ACCENT_HI, C_ON_ACCENT) then
-                leaderStart(ui.delay[0], ui.countdown[0])
+                local delay, cd = ui.delay[0], ui.countdown[0]
+                uiDo('запуск', function() leaderStart(delay, cd) end)
             end
             imgui.SameLine(0, 8)
             if colorButton(u8'СТОП ВСЕМ', bw, 42, C_RED_BG, C_RED, C_TEXT) then
-                leaderStop()
+                uiDo('стоп всем', leaderStop)
             end
             endCard()
         else
@@ -1600,7 +1705,7 @@ if hasImgui then
                 'а остановить его ты можешь только у себя.')
             imgui.Dummy(V2(0, 2))
             if colorButton(u8'Остановить у себя', W - 28, 38, C_RED_BG, C_RED, C_TEXT) then
-                stopFlood('остановлено вручную')
+                uiDo('стоп у себя', function() stopFlood('остановлено вручную') end)
             end
             endCard()
         end
@@ -1688,7 +1793,7 @@ if hasImgui then
             if leader then
                 glowRect(imgui.GetCursorScreenPos(), contentWidth(), 32, C_ACCENT, 7, 0.7)
                 if colorButton(u8'Сканировать', contentWidth(), 32, C_ACCENT, C_ACCENT_HI, C_ON_ACCENT) then
-                    leaderScan()
+                    uiDo('сканирование', leaderScan)
                 end
             else
                 imgui.TextDisabled(u8'Сканирование запускает лидер.')
@@ -1715,14 +1820,18 @@ if hasImgui then
         imgui.Dummy(V2(0, 2))
         if leader then
             local bw = (contentWidth() - 8) / 2
-            if imgui.Button(u8'Обновить у себя', V2(bw, 32)) then loadRemoteRoster(true) end
+            if imgui.Button(u8'Обновить у себя', V2(bw, 32)) then
+                uiDo('обновить у себя', function() loadRemoteRoster(true) end)
+            end
             imgui.SameLine(0, 8)
             glowRect(imgui.GetCursorScreenPos(), bw, 32, C_ACCENT, 7, 0.7)
             if colorButton(u8'Обновить у всех', bw, 32, C_ACCENT, C_ACCENT_HI, C_ON_ACCENT) then
-                leaderSync()
+                uiDo('обновить у всех', leaderSync)
             end
         else
-            if imgui.Button(u8'Обновить список', V2(contentWidth(), 32)) then loadRemoteRoster(true) end
+            if imgui.Button(u8'Обновить список', V2(contentWidth(), 32)) then
+                uiDo('обновить список', function() loadRemoteRoster(true) end)
+            end
         end
     end
 
@@ -1767,11 +1876,13 @@ if hasImgui then
         local bw = (contentWidth() - 8) / 2
         if imgui.Button(u8'Проверить обновления', V2(bw, 32)) then
             setNotice('Проверяю обновления...')
-            checkForUpdate(true)
+            uiDo('проверка обновлений', function() checkForUpdate(true) end)
         end
         imgui.SameLine(0, 8)
         if imgui.Button(u8'Перечитать конфиг', V2(bw, 32)) then
-            if reloadAll() then setNotice('Конфиг перечитан.') end
+            uiDo('перечитать конфиг', function()
+                if reloadAll() then setNotice('Конфиг перечитан.') end
+            end)
         end
     end
 
@@ -1780,7 +1891,9 @@ if hasImgui then
             imgui.Dummy(V2(0, 6))
             mutedWrapped('Есть несохранённые изменения.')
             local bw = (contentWidth() - 8) / 2
-            if colorButton(u8'Сохранить', bw, 34, C_ACCENT, C_ACCENT_HI, C_ON_ACCENT) then saveFromUi() end
+            if colorButton(u8'Сохранить', bw, 34, C_ACCENT, C_ACCENT_HI, C_ON_ACCENT) then
+                uiDo('сохранить настройки', saveFromUi)
+            end
             imgui.SameLine(0, 8)
             if imgui.Button(u8'Отменить', V2(bw, 34)) then
                 syncUi()
@@ -1849,6 +1962,7 @@ if hasImgui then
         local io_ = imgui.GetIO()
         io_.IniFilename = nil
         -- шрифты с кириллицей, иначе вместо русских букв будут знаки вопроса
+        mark('шрифты: начало')
         local regular = pickFont({ 'segoeui.ttf', 'trebuc.ttf', 'arial.ttf' })
         local bold = pickFont({ 'segoeuib.ttf', 'trebucbd.ttf', 'arialbd.ttf' }) or regular
         if regular then
@@ -1860,16 +1974,19 @@ if hasImgui then
             F.big   = io_.Fonts:AddFontFromFileTTF(bold, 24.0, nil, ranges)
         end
         pcall(applyTheme)
+        mark('шрифты: готово')
     end)
 
     imgui.OnFrame(
         function() return ui.open[0] end,
         function(player)
+            mark('кадр: начало')
             local sw, sh = getScreenResolution()
             imgui.SetNextWindowPos(V2(sw / 2, sh / 2), imgui.Cond.FirstUseEver, V2(0.5, 0.5))
             imgui.SetNextWindowSize(V2(480, 610), imgui.Cond.Always)
             local flags = imgui.WindowFlags.NoTitleBar + imgui.WindowFlags.NoResize + imgui.WindowFlags.NoCollapse
             if imgui.Begin('AMARAYTHEN Capter##sfmain', ui.open, flags) then
+                mark('окно')
                 -- неоновый ореол вокруг окна (рисуется позади всех окон)
                 pcall(function()
                     local pos, size = imgui.GetWindowPos(), imgui.GetWindowSize()
@@ -1881,8 +1998,11 @@ if hasImgui then
                             u32(C_ACCENT, 0.035 * k), 12 + e)
                     end
                 end)
+                mark('ореол')
                 drawHeader()
+                mark('шапка')
                 drawTabs()
+                mark('вкладки, открыта ' .. ui.tab)
                 if ui.tab == 1 then
                     drawLaunchTab()
                 elseif ui.tab == 2 then
@@ -1892,9 +2012,13 @@ if hasImgui then
                 else
                     drawSettingsTab()
                 end
+                mark('вкладка нарисована')
                 drawFooter()
+                mark('низ')
             end
             imgui.End()
+            mark('кадр: конец')
+            markFrames = markFrames - 1
         end
     )
 end
@@ -1914,6 +2038,10 @@ local function cmdSf(arg)
     if cmd == '' or cmd == 'menu' then
         if ui then
             ui.open[0] = not ui.open[0]
+            if ui.open[0] then
+                trace('меню открыто')
+                startMenuTrace()
+            end
         else
             msg('Меню недоступно: не установлена библиотека mimgui. Команды работают.')
             msg(HELP)
@@ -2035,7 +2163,9 @@ function main()
     if not isSampLoaded() or not isSampfuncsLoaded() then return end
     while not isSampAvailable() do wait(100) end
 
-    math.randomseed(os.time() + (myId() or 0))  -- чтобы разброс откликов был у всех разный
+    -- разброс откликов у всех разный; свой ID здесь не берём - персонаж может быть ещё не в игре
+    math.randomseed(os.time() + math.floor((os.clock() % 1) * 1000000))
+    trace('старт v' .. thisScript().version)
     sampRegisterChatCommand('ac', cmdSf)
     loadConfig(false)
     if roster.version > 0 then
@@ -2058,6 +2188,18 @@ function main()
         local now = os.clock()
 
         processOutbox(now)
+        pollDownloads(now)
+
+        -- действия, нажатые в меню: выполняются здесь, а не во время отрисовки окна
+        if #uiActions > 0 then
+            local actions = uiActions
+            uiActions = {}
+            for _, a in ipairs(actions) do
+                trace('меню: ' .. a.name)
+                local ok, err = pcall(a.fn)
+                if not ok then print('[AMARAYTHEN] ошибка действия «' .. a.name .. '»: ' .. tostring(err)) end
+            end
+        end
 
         -- запланированный авто-запуск: собрали отклики - отправляем код
         if pendingGo and now >= pendingGo.at and not outbox then
