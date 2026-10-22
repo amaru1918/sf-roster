@@ -1,7 +1,9 @@
-script_name('SF Capture')
-script_author('SF')
-script_version('1.8')
-script_description('Синхронный флуд /capture волной. Запуск лидером через /fc.')
+script_name('AMARAYTHEN Capter')
+script_author('amaru')
+script_version('2.2')
+script_description('AMARAYTHEN Capter by amaru: синхронный флуд /capture волной. Запуск лидером через /fc.')
+-- Совместимость с автообновлением v1.8-v1.9, которые ищут в новом файле прежнее имя.
+-- Не удалять: script_name('SF Capture')
 
 require 'lib.moonloader'
 local sampev   = require 'lib.samp.events'
@@ -18,33 +20,25 @@ if hasImgui then
     u8 = encoding.UTF8
 end
 
--- Ники лидеров и ростер, а также основные настройки хранятся в конфиге:
---   moonloader\config\sf_capture.ini
--- Если файла нет, скрипт создаст его сам при первом запуске.
--- Значения ниже - запасные, на случай если в конфиге чего-то не хватает.
+-- Ростер и лидеры берутся только из общего списка на GitHub (ссылка ниже, менять её
+-- может только тот, кто выпускает скрипт). В конфиге moonloader\config\sf_capture.ini
+-- хранятся лишь личные настройки игрока. Значения ниже - запасные.
 
 -- ============================ НАСТРОЙКИ ============================
 local CFG = {
-    leaders        = {},          -- из конфига, секция [leaders]
-    roster         = {},          -- из конфига, секция [roster]
-    nick_notes     = {},          -- комментарии после ников в конфиге
-    roster_version = 1,
-    roster_url     = '',          -- ссылка, которая реально используется ('' - без ссылки)
-    roster_url_cfg = '',          -- что вписано в конфиге
-    -- Общий ростер на GitHub. Используется, если в конфиге roster_url пустой.
-    default_roster_url = 'https://raw.githubusercontent.com/amaru1918/sf-roster/main/sf_roster.txt',
+    -- Общий список: ростер и лидеры.
+    roster_url      = 'https://raw.githubusercontent.com/amaru1918/sf-roster/main/sf_roster.txt',
+    roster_refresh  = 120,        -- как часто перепроверять список, с (когда нет флуда)
+    -- Лидеры, пока общий список ещё ни разу не скачан или в нём нет секции [leaders].
+    default_leaders = { 'Escay_Eastwood' },
     -- Автообновление: отсюда скачивается новая версия скрипта.
     update_url      = 'https://raw.githubusercontent.com/amaru1918/sf-roster/main/sf_capture.lua',
     auto_update     = true,
     update_interval = 1800,       -- как часто проверять обновления, с
-    -- Лидеры на случай, если в общем списке нет секции [leaders] или он ещё не скачан.
-    -- При общем списке лидеры из локального конфига НЕ учитываются.
-    default_leaders = { 'Escay_Eastwood' },
-    roster_refresh = 120,         -- как часто перепроверять ростер по ссылке, с (когда нет флуда)
 
     chat_cmd          = '/fc',       -- чат управления
     code_prefix       = '#SF',       -- метка служебных сообщений
-    debug             = false,       -- то же, что /sf debug
+    debug             = false,       -- то же, что /ac debug
     flood_cmd         = '/capture',  -- что флудим
     default_countdown = 3,           -- отсчёт до старта, с (если лидер не указал)
     min_delay         = 20,          -- допустимая задержка на игрока, мс
@@ -70,11 +64,12 @@ local CFG = {
 }
 -- ==================================================================
 
-local TAG       = '{C9A227}[SF]{CFCFCF} '
+local TAG       = '{C9A227}[AMARAYTHEN]{CFCFCF} '
 local TAG_COLOR = 0xC9A227
 
--- leaders - лидеры из общего списка (nil, если там их нет или используется локальный ростер)
-local roster = { version = CFG.roster_version, list = CFG.roster, leaders = nil }
+-- Общий список. leaders = nil, если в нём нет секции [leaders].
+-- Версия 0 - список ещё ни разу не скачивался.
+local roster = { version = 0, list = {}, leaders = nil }
 
 local state = {
     phase     = 'idle',   -- idle | countdown | running
@@ -149,13 +144,10 @@ local function isOnline(nick)
     return false
 end
 
--- Действующий список лидеров. При общем ростере по ссылке - только из него (или встроенный),
--- локальный конфиг не учитывается, чтобы никто не мог назначить себя лидером.
+-- Действующий список лидеров: только из общего списка на GitHub (или встроенный),
+-- поэтому назначить себя лидером у себя в игре нельзя.
 local function leaderList()
-    if CFG.roster_url ~= '' then
-        return roster.leaders or CFG.default_leaders
-    end
-    return CFG.leaders
+    return roster.leaders or CFG.default_leaders
 end
 
 local function isLeader(nick)
@@ -231,17 +223,17 @@ local applyCachedRoster
 local function beginCountdown(leader, delay, cd, ver, codeAt)
     if ver ~= roster.version then
         if ver < roster.version then
-            msg(string.format('{FF6060}У лидера устаревший ростер (v%d, у тебя v%d) - пусть наберёт /sf reload.',
+            msg(string.format('{FF6060}У лидера устаревший список (v%d, у тебя v%d) - пусть наберёт /ac reload.',
                 ver, roster.version))
         else
-            msg(string.format('{FF6060}Ростер не совпадает: у лидера v%d, у тебя v%d. Набери /sf reload.',
+            msg(string.format('{FF6060}Список не совпадает: у лидера v%d, у тебя v%d. Набери /ac reload.',
                 ver, roster.version))
         end
         return
     end
     local slot, active = computeSlot()
     if not slot then
-        msg('Тебя нет в ростере, в этом запуске не участвуешь.')
+        msg('Тебя нет в списке, в этом запуске не участвуешь.')
         return
     end
     delay = math.max(CFG.min_delay, math.min(CFG.max_delay, delay))
@@ -315,10 +307,10 @@ local function processOutbox(now)
             outbox = nil
             if kind == 'GO' then
                 msg('{FF6060}Код не вернулся из ' .. CFG.chat_cmd ..
-                    ' или не распознан. Включи /sf debug и повтори запуск.')
+                    ' или не распознан. Включи /ac debug и повтори запуск.')
             else
                 msg('{FF6060}Стоп не прошёл в ' .. CFG.chat_cmd ..
-                    '. Повтори /sf stop, иначе остальные остановятся по автостопу.')
+                    '. Повтори /ac stop, иначе остальные остановятся по автостопу.')
             end
         end
     end
@@ -335,17 +327,17 @@ local lastForeignCatchUp = -100
 local function catchUpAndStart(sender, delay, cd, ver)
     local receivedAt = os.clock()
     if isLeader(sender) then
-        msg(string.format('У лидера ростер новее (v%d, у тебя v%d), обновляю...', ver, roster.version))
+        msg(string.format('У лидера список новее (v%d, у тебя v%d), обновляю...', ver, roster.version))
     else
         dbg(string.format('код от %s с версией v%d, проверяю общий список', sender, ver))
     end
     loadRemoteRoster(false, function()
         if not isLeader(sender) then
-            dbg('после обновления ростера ' .. sender .. ' всё равно не лидер - игнор')
+            dbg('после обновления списка ' .. sender .. ' всё равно не лидер - игнор')
         elseif roster.version ~= ver then
-            msg(string.format('{FF6060}Не удалось получить ростер v%d, в этом запуске не участвуешь.', ver))
+            msg(string.format('{FF6060}Не удалось получить список v%d, в этом запуске не участвуешь.', ver))
         elseif state.lastStopAt >= receivedAt then
-            msg('Пока обновлялся ростер, лидер уже остановил запуск.')
+            msg('Пока обновлялся список, лидер уже остановил запуск.')
         elseif state.phase == 'idle' then
             beginCountdown(sender, delay, cd, ver, receivedAt)
         end
@@ -368,7 +360,7 @@ local function handleCode(clean, codePos)
     local d, cd, ver = rest:match('^%s+GO%s+(%d+)%s+(%d+)%s+(%d+)')
     if d then
         d, cd, ver = tonumber(d), tonumber(cd), tonumber(ver)
-        if CFG.roster_url ~= '' and ver > roster.version then
+        if ver > roster.version then
             -- не лидер по моему списку - обновляемся не чаще раза в 10 с, чтобы нельзя было
             -- заставить всех постоянно качать список
             if not isLeader(sender) then
@@ -408,25 +400,16 @@ local function handleCode(clean, codePos)
 end
 
 -- ----------------------------- конфиг ------------------------------
+-- В конфиге только личные настройки игрока. Ростер и лидеры - в общем списке на GitHub.
 local function buildConfigText(o)
-    local notes = o.notes or {}
     local L = {
-        '; ===================== SF Capture - конфиг =====================',
+        '; ============== AMARAYTHEN Capter by amaru - конфиг ==============',
         '; Строки, начинающиеся с ; - комментарии.',
-        '; После правки файла набери в игре /sf reload (или перезайди).',
-        '; Всё это можно менять и в меню: команда /sf.',
+        '; После правки файла набери в игре /ac reload (или перезайди).',
+        '; Всё это можно менять и в меню: команда /ac.',
+        '; Ники участников и лидеров здесь не хранятся - они берутся из общего списка состава.',
         '',
         '[settings]',
-        '; Версия ростера. Поменял список [roster] - увеличь число на 1',
-        '; и раздай этот файл всем участникам. У лидера и у всех она должна совпадать.',
-        'roster_version = ' .. o.roster_version,
-        '',
-        '; Откуда брать ростер:',
-        ';   пусто - общий список состава на GitHub (ссылка встроена в скрипт), обновляется сам;',
-        ';   своя ссылка на raw-файл - брать оттуда;',
-        ';   off - не скачивать, брать список из секции [roster] ниже.',
-        'roster_url =' .. (o.roster_url ~= '' and (' ' .. o.roster_url) or ''),
-        '',
         '; Чат, через который лидер запускает флуд',
         'chat_cmd = ' .. o.chat_cmd,
         '',
@@ -443,41 +426,32 @@ local function buildConfigText(o)
         '; доходили до сервера по плану, даже если пинг у игроков разный (true/false)',
         'ping_compensation = ' .. tostring(o.ping_compensation ~= false),
         '',
-        '; Автообновление скрипта с GitHub (true/false)',
+        '; Автообновление скрипта (true/false)',
         'auto_update = ' .. tostring(o.auto_update ~= false),
-        '',
-        '[leaders]',
-        '; Кто может запускать и останавливать флуд. По одному нику в строке.',
-        '; Учитываются, только если roster_url = off. С общим списком лидеры задаются в нём.',
     }
-    for _, n in ipairs(o.leaders) do
-        local note = notes['leaders:' .. norm(n)]
-        L[#L + 1] = note and (n .. ' ' .. note) or n
-    end
-    L[#L + 1] = ''
-    L[#L + 1] = '[roster]'
-    L[#L + 1] = '; Участники волны. По одному нику в строке. Учитываются, только если roster_url = off.'
-    L[#L + 1] = '; ПОРЯДОК ДОЛЖЕН БЫТЬ ОДИНАКОВЫМ У ВСЕХ - он определяет очерёдность в волне.'
-    for _, n in ipairs(o.roster) do
-        local note = notes['roster:' .. norm(n)]
-        L[#L + 1] = note and (n .. ' ' .. note) or n
-    end
     return table.concat(L, '\n') .. '\n'
 end
 
-local DEFAULT_CONFIG = buildConfigText({
-    roster_version = 1, roster_url = '', chat_cmd = '/fc', countdown = 3,
-    max_duration = 120, hide_responses = false, ping_compensation = true, auto_update = true,
-    leaders = { 'Escay_Eastwood' }, roster = { 'Escay_Eastwood' },
-})
+local function currentSettings()
+    return {
+        chat_cmd = CFG.chat_cmd, countdown = CFG.default_countdown, max_duration = CFG.max_duration,
+        hide_responses = CFG.hide_responses, ping_compensation = CFG.ping_compensation,
+        auto_update = CFG.auto_update,
+    }
+end
+
+local DEFAULT_CONFIG = buildConfigText(currentSettings())
 
 local function configPath()
     return getWorkingDirectory() .. '\\config\\sf_capture.ini'
 end
 
+-- obsolete = true, если в файле остались ссылки или списки ников от старых версий
+local OBSOLETE_KEYS = { roster_url = true, roster_version = true }
+
 local function parseConfig(content)
     content = content:gsub('^\239\187\191', '') -- BOM, если файл сохранили в UTF-8
-    local out = { settings = {}, leaders = {}, roster = {}, notes = {} }
+    local out = { settings = {}, obsolete = false }
     local section
     for raw in content:gmatch('[^\r\n]+') do
         local line = trim(raw)
@@ -485,15 +459,12 @@ local function parseConfig(content)
             local sec = line:match('^%[(.-)%]$')
             if sec then
                 section = lower(trim(sec))
+                if section ~= 'settings' then out.obsolete = true end
             elseif section == 'settings' then
                 local k, v = line:match('^([%w_]+)%s*=%s*(.-)$')
-                if k then out.settings[lower(k)] = trim(v) end
-            elseif section == 'leaders' or section == 'roster' then
-                -- всё после ника (через пробел или ;) - комментарий, он сохраняется
-                local nick, note = line:match('^([^%s;]+)%s*(.*)$')
-                if nick then
-                    table.insert(out[section], nick)
-                    if note ~= '' then out.notes[section .. ':' .. norm(nick)] = note end
+                if k then
+                    k = lower(k)
+                    if OBSOLETE_KEYS[k] then out.obsolete = true else out.settings[k] = trim(v) end
                 end
             end
         end
@@ -534,15 +505,6 @@ local function loadConfig(verbose)
     local c = parseConfig(content)
     local s = c.settings
 
-    CFG.roster_version    = tonumber(s.roster_version) or CFG.roster_version
-    CFG.roster_url_cfg    = s.roster_url or ''
-    if CFG.roster_url_cfg == '' then
-        CFG.roster_url = CFG.default_roster_url
-    elseif lower(CFG.roster_url_cfg) == 'off' then
-        CFG.roster_url = ''
-    else
-        CFG.roster_url = CFG.roster_url_cfg
-    end
     CFG.default_countdown = tonumber(s.countdown) or CFG.default_countdown
     CFG.max_duration      = tonumber(s.max_duration) or CFG.max_duration
     if s.chat_cmd and s.chat_cmd ~= '' then CFG.chat_cmd = s.chat_cmd end
@@ -550,23 +512,20 @@ local function loadConfig(verbose)
     CFG.ping_compensation = lower(s.ping_compensation or 'true') ~= 'false'
     CFG.auto_update       = lower(s.auto_update or 'true') ~= 'false'
 
-    CFG.leaders, CFG.roster, CFG.nick_notes = c.leaders, c.roster, c.notes
-    roster.version, roster.list, roster.leaders = CFG.roster_version, CFG.roster, nil
-    -- с общим списком сначала берём его сохранённую копию, пока качается свежая
-    if CFG.roster_url ~= '' then applyCachedRoster() end
-
-    if CFG.roster_url == '' then
-        if #CFG.leaders == 0 then msg('{FF6060}В конфиге нет ни одного лидера (секция [leaders]).') end
-        if #CFG.roster == 0 then msg('{FF6060}В конфиге пустой ростер (секция [roster]).') end
-    end
-    if verbose then
-        if CFG.roster_url ~= '' then
-            msg('Конфиг загружен, ростер и лидеры берутся из общего списка...')
-        else
-            msg(string.format('Конфиг загружен: лидеров %d, ростер v%d - %d ников.',
-                #CFG.leaders, roster.version, #roster.list))
+    -- конфиг от старой версии: убираем из него ссылки и списки ников, настройки сохраняем
+    if c.obsolete then
+        local w = io.open(path, 'w')
+        if w then
+            w:write(buildConfigText(currentSettings()))
+            w:close()
+            msg('Конфиг очищен от старых ссылок и ников: теперь они берутся из общего списка.')
         end
     end
+
+    -- пока свежий общий список не скачан, берём его сохранённую копию
+    if roster.version == 0 then applyCachedRoster() end
+
+    if verbose then msg('Конфиг загружен.') end
     syncUi()
 end
 
@@ -644,13 +603,6 @@ local rosterCheckedAt = -1000
 -- verbose - писать в чат и об успехе, и об ошибках (иначе - только если список изменился).
 -- onDone(ok) вызывается по завершении, timeoutMs - сколько ждать ответа.
 loadRemoteRoster = function(verbose, onDone, timeoutMs)
-    if CFG.roster_url == '' then
-        if verbose then
-            msg(string.format('Ростер берётся из конфига (v%d, %d ников).', roster.version, #roster.list))
-        end
-        if onDone then onDone(false) end
-        return
-    end
     local dir = getWorkingDirectory() .. '\\config'
     if not doesDirectoryExist(dir) then createDirectory(dir) end
     local path = dir .. '\\sf_roster.txt'
@@ -668,19 +620,19 @@ loadRemoteRoster = function(verbose, onDone, timeoutMs)
     end
 
     local url = rosterDownloadUrl(CFG.roster_url)
-    dbg('скачиваю ростер: ' .. url)
+    dbg('скачиваю список: ' .. url)
     downloadUrlToFile(url, path, function(id, status)
         if status ~= dlstatus.STATUS_ENDDOWNLOADDATA or done or request ~= rosterRequest then return end
         local f = io.open(path, 'r')
         if not f then
-            finish(false, verbose and '{FF6060}Не удалось скачать ростер по ссылке, оставлен прежний список.' or nil)
+            finish(false, verbose and '{FF6060}Не удалось скачать общий список, оставлен сохранённый.' or nil)
             return
         end
         local content = f:read('*a')
         f:close()
         local ver, list, leaders = parseRoster(content)
         if not ver then
-            finish(false, verbose and '{FF6060}Ростер по ссылке в неверном формате, оставлен прежний список.' or nil)
+            finish(false, verbose and '{FF6060}Общий список в неверном формате, оставлен сохранённый.' or nil)
             return
         end
         local changed = ver ~= roster.version
@@ -700,13 +652,14 @@ loadRemoteRoster = function(verbose, onDone, timeoutMs)
     lua_thread.create(function()
         wait(timeoutMs or 10000)
         if not done and request == rosterRequest then
-            finish(false, verbose and '{FF6060}Ростер по ссылке не скачался, оставлен прежний список. Проверь интернет.' or nil)
+            finish(false, verbose and '{FF6060}Общий список не скачался, оставлен сохранённый. Проверь интернет.' or nil)
         end
     end)
 end
 
 -- ------------------------- автообновление --------------------------
--- Метка для проверки кодировки скачанного обновления. Не менять и не удалять:
+-- Метка для проверки кодировки скачанного обновления. Не менять и не удалять
+-- (её ищут и уже установленные старые версии):
 -- если файл на GitHub пересохранили не в Windows-1251, этой строки в нём не найдётся.
 local UPDATE_MARKER = 'SF-CAPTURE: метка кодировки'
 
@@ -768,8 +721,10 @@ local function checkForUpdate(verbose)
         os.remove(path)
 
         local newVersion = content:match("script_version%(%s*'([^']+)'%s*%)")
-        if not newVersion or not content:find("script_name('SF Capture')", 1, true) then
-            finish(verbose and '{FF6060}Файл обновления на GitHub не похож на SF Capture.' or nil)
+        local isOurs = content:find("script_name('AMARAYTHEN Capter')", 1, true)
+            or content:find("script_name('SF Capture')", 1, true)
+        if not newVersion or not isOurs then
+            finish(verbose and '{FF6060}Файл обновления на GitHub не похож на AMARAYTHEN Capter.' or nil)
             return
         end
         if not isNewerVersion(newVersion, thisScript().version) then
@@ -800,12 +755,6 @@ end
 
 -- --------------------------- действия ------------------------------
 local function leaderStart(delay, cd)
-    local me = myNick() or ''
-    -- с локальным списком проверяем сразу, с общим - после его обновления (в send)
-    if CFG.roster_url == '' and not isLeader(me) then
-        msg('Запускать может только лидер. Твой ник в игре: ' .. (me ~= '' and me or 'не определён') .. '.')
-        return
-    end
     delay = math.floor(delay)
     if delay < CFG.min_delay or delay > CFG.max_delay then
         msg(string.format('Задержка должна быть от %d до %d мс.', CFG.min_delay, CFG.max_delay))
@@ -821,18 +770,18 @@ local function leaderStart(delay, cd)
             msg('Запускать может только лидер. Твой ник в игре: ' .. (nick ~= '' and nick or 'не определён') .. '.')
             return
         end
+        if roster.version == 0 then
+            msg('{FF6060}Общий список ещё ни разу не скачался - запуск невозможен. Проверь интернет.')
+            return
+        end
         local line = string.format('%s %s GO %d %d %d', CFG.chat_cmd, CFG.code_prefix, delay, cd, roster.version)
         msg(string.format('Код запуска отправлен в %s (задержка %d мс, отсчёт %d с), жду ответ сервера...',
             CFG.chat_cmd, delay, cd))
         queueLeaderMessage('GO', line, CFG.go_tries)
     end
-    if CFG.roster_url ~= '' then
-        -- перед запуском сверяемся с общим списком, чтобы у лидера была последняя версия
-        msg('Проверяю ростер...')
-        loadRemoteRoster(false, send, 3000)
-    else
-        send()
-    end
+    -- перед запуском сверяемся с общим списком, чтобы у лидера была последняя версия
+    msg('Проверяю список...')
+    loadRemoteRoster(false, send, 3000)
 end
 
 local function leaderStop()
@@ -862,28 +811,33 @@ if hasImgui then
     local new = imgui.new
     local V2, V4 = imgui.ImVec2, imgui.ImVec4
 
-    local C_ACCENT = V4(0.79, 0.64, 0.15, 1.00)
-    local C_GREEN  = V4(0.45, 0.85, 0.45, 1.00)
-    local C_GREY   = V4(0.55, 0.55, 0.55, 1.00)
-    local C_RED    = V4(0.95, 0.40, 0.40, 1.00)
+    -- палитра: насыщенный янтарно-жёлтый неон на тёмном графите
+    local C_ACCENT    = V4(1.00, 0.76, 0.03, 1.00) -- основной жёлтый
+    local C_ACCENT_HI = V4(1.00, 0.85, 0.28, 1.00)
+    local C_NEON_CORE = V4(1.00, 0.95, 0.72, 1.00) -- светлая «сердцевина» неона
+    local C_ON_ACCENT = V4(0.07, 0.05, 0.00, 1.00) -- текст на жёлтом
+    local C_TEXT      = V4(0.96, 0.96, 0.98, 1.00)
+    local C_MUTED     = V4(0.60, 0.62, 0.69, 1.00)
+    local C_WINDOW    = V4(0.045, 0.047, 0.06, 0.98)
+    local C_PANEL     = V4(0.095, 0.10, 0.125, 1.00)
+    local C_PANEL_HI  = V4(0.16, 0.165, 0.20, 1.00)
+    local C_BORDER    = V4(0.22, 0.23, 0.29, 1.00)
+    local C_GREEN     = V4(0.18, 0.96, 0.46, 1.00)
+    local C_RED       = V4(1.00, 0.25, 0.27, 1.00)
+    local C_RED_BG    = V4(0.62, 0.09, 0.12, 1.00)
 
     ui = {
         open      = new.bool(false),
         tab       = 1,
         delay     = new.int(400),
         countdown = new.int(3),
-        addRoster = new.char[32](),
-        addLeader = new.char[32](),
         chatCmd   = new.char[32](),
-        url       = new.char[256](),
         defCd     = new.int(3),
         maxDur    = new.int(120),
         hide      = new.bool(false),
         ping      = new.bool(true),
         autoUpd   = new.bool(true),
         debug     = new.bool(false),
-        roster    = {},
-        leaders   = {},
         dirty     = false,
         online    = {},
         onlineAt  = -1,
@@ -892,13 +846,9 @@ if hasImgui then
         noticeAt  = 0,
     }
 
-    -- черновик меню = копия текущего конфига
+    -- черновик меню = копия текущих настроек
     syncUi = function()
-        ui.roster, ui.leaders = {}, {}
-        for i, n in ipairs(CFG.roster) do ui.roster[i] = n end
-        for i, n in ipairs(CFG.leaders) do ui.leaders[i] = n end
         imgui.StrCopy(ui.chatCmd, CFG.chat_cmd)
-        imgui.StrCopy(ui.url, CFG.roster_url_cfg)
         ui.defCd[0]     = CFG.default_countdown
         ui.maxDur[0]    = CFG.max_duration
         ui.hide[0]      = CFG.hide_responses
@@ -936,34 +886,6 @@ if hasImgui then
         ui.online = set
     end
 
-    local function listHas(list, nick)
-        for _, n in ipairs(list) do
-            if norm(n) == norm(nick) then return true end
-        end
-        return false
-    end
-
-    local function sameList(a, b)
-        return table.concat(a, '\n') == table.concat(b, '\n')
-    end
-
-    -- ник или ID игрока -> ник
-    local function resolveNickInput(text)
-        text = trim(text)
-        if text == '' then return nil, 'Введи ник или ID игрока.' end
-        if text:match('^%d+$') then
-            local id = tonumber(text)
-            local ok, myid = sampGetPlayerIdByCharHandle(PLAYER_PED)
-            if ok and id == myid then return myNick() end
-            if sampIsPlayerConnected(id) then return sampGetPlayerNickname(id) end
-            return nil, 'Игрока с ID ' .. id .. ' нет на сервере.'
-        end
-        if not text:match('^[%w_%.%[%]%(%)%$@=]+$') then
-            return nil, 'В нике недопустимые символы.'
-        end
-        return text
-    end
-
     local function saveFromUi()
         if state.phase ~= 'idle' then
             setNotice('Во время флуда сохранять нельзя.', true)
@@ -974,87 +896,309 @@ if hasImgui then
             setNotice('Чат управления должен быть командой, например /fc.', true)
             return
         end
-        if lower(trim(ffi.string(ui.url))) == 'off' and #ui.leaders == 0 then
-            setNotice('Нужен хотя бы один лидер.', true)
-            return
-        end
-        local rosterChanged  = not sameList(ui.roster, CFG.roster)
-        local leadersChanged = not sameList(ui.leaders, CFG.leaders)
         local o = {
-            roster_version = CFG.roster_version + (rosterChanged and 1 or 0),
-            roster_url     = trim(ffi.string(ui.url)),
-            chat_cmd       = chat,
-            countdown      = ui.defCd[0],
-            max_duration   = ui.maxDur[0],
-            hide_responses = ui.hide[0],
+            chat_cmd          = chat,
+            countdown         = ui.defCd[0],
+            max_duration      = ui.maxDur[0],
+            hide_responses    = ui.hide[0],
             ping_compensation = ui.ping[0],
-            auto_update    = ui.autoUpd[0],
-            leaders        = ui.leaders,
-            roster         = ui.roster,
-            notes          = CFG.nick_notes,
+            auto_update       = ui.autoUpd[0],
         }
         if not writeConfig(o) then
             setNotice('Не удалось записать sf_capture.ini.', true)
             return
         end
         loadConfig(false)
-        loadRemoteRoster(true)
-        if rosterChanged or leadersChanged then
-            setNotice(string.format('Сохранено, ростер v%d. Раздай sf_capture.ini всем участникам.', roster.version))
-        else
-            setNotice('Сохранено.')
+        setNotice('Сохранено.')
+    end
+
+    local TABS = { 'Запуск', 'Список', 'Лидеры', 'Настройки' }
+    local F = {}       -- шрифты: body, bold, title, big
+    local PAD = 16     -- внутренний отступ окна
+
+    local function u32(c, a)
+        return imgui.ColorConvertFloat4ToU32(V4(c.x, c.y, c.z, a or c.w))
+    end
+
+    local function withFont(font, fn)
+        if font then imgui.PushFont(font) end
+        fn()
+        if font then imgui.PopFont() end
+    end
+
+    local function contentWidth()
+        return imgui.GetWindowWidth() - PAD * 2
+    end
+
+    -- ------------------------------ неон -------------------------------
+    -- Плавное «дыхание» яркости свечения
+    local function pulse()
+        return 0.82 + 0.18 * math.sin(os.clock() * 2.4)
+    end
+
+    -- Свечение вокруг прямоугольника: несколько полупрозрачных слоёв, рисуется ДО элемента
+    local function glowRect(p, w, h, color, rounding, strength)
+        local dl = imgui.GetWindowDrawList()
+        local k = (strength or 1) * pulse()
+        for i = 4, 1, -1 do
+            local e = i * 2
+            dl:AddRectFilled(V2(p.x - e, p.y - e), V2(p.x + w + e, p.y + h + e),
+                u32(color, 0.055 * k), rounding + e)
         end
     end
 
-    local TABS = { 'Запуск', 'Ростер', 'Лидеры', 'Настройки' }
+    -- Неоновая надпись: ореол, свечение вокруг букв и светлая сердцевина
+    local function neonText(text, core, glow)
+        local p = imgui.GetCursorScreenPos()
+        local ts = imgui.CalcTextSize(text)
+        local k = pulse()
+        local dl = imgui.GetWindowDrawList()
+        for i = 4, 1, -1 do
+            local e = i * 3
+            dl:AddRectFilled(V2(p.x - e, p.y - e * 0.5), V2(p.x + ts.x + e, p.y + ts.y + e * 0.5),
+                u32(glow, 0.03 * k), ts.y)
+        end
+        for _, r in ipairs({ 3, 2, 1 }) do
+            local a = (0.09 + (3 - r) * 0.07) * k
+            for s = 0, 7 do
+                local ang = s * math.pi / 4
+                imgui.SetCursorScreenPos(V2(p.x + math.cos(ang) * r, p.y + math.sin(ang) * r))
+                imgui.TextColored(V4(glow.x, glow.y, glow.z, a), text)
+            end
+        end
+        imgui.SetCursorScreenPos(p)
+        imgui.TextColored(core, text)
+    end
+
+    local function mutedWrapped(s)
+        imgui.PushStyleColor(imgui.Col.Text, C_MUTED)
+        imgui.TextWrapped(u8(s))
+        imgui.PopStyleColor(1)
+    end
+
+    -- «таблетка»: цветная плашка с текстом (и точкой). text уже в UTF-8.
+    local function pillWidth(text, dot)
+        return imgui.CalcTextSize(text).x + (dot and 26 or 16)
+    end
+
+    local function pill(text, color, dot)
+        local dl = imgui.GetWindowDrawList()
+        local p = imgui.GetCursorScreenPos()
+        local w, h = pillWidth(text, dot), imgui.GetTextLineHeight() + 6
+        dl:AddRectFilled(p, V2(p.x + w, p.y + h), u32(color, 0.16), h / 2)
+        local tx = p.x + 8
+        if dot then
+            local c = V2(p.x + 11, p.y + h / 2)
+            dl:AddCircleFilled(c, 7, u32(color, 0.18 * pulse()), 16) -- свечение точки
+            dl:AddCircleFilled(c, 3.5, u32(color), 12)
+            tx = p.x + 19
+        end
+        imgui.SetCursorScreenPos(V2(tx, p.y + 3))
+        imgui.TextColored(color, text)
+        imgui.SetCursorScreenPos(p)
+        imgui.Dummy(V2(w, h))
+    end
+
+    -- кнопка своего цвета
+    local function colorButton(label, w, h, base, hover, textColor)
+        imgui.PushStyleColor(imgui.Col.Button, base)
+        imgui.PushStyleColor(imgui.Col.ButtonHovered, hover)
+        imgui.PushStyleColor(imgui.Col.ButtonActive, hover)
+        imgui.PushStyleColor(imgui.Col.Text, textColor or C_TEXT)
+        local clicked
+        withFont(F.bold, function() clicked = imgui.Button(label, V2(w, h)) end)
+        imgui.PopStyleColor(4)
+        return clicked
+    end
+
+    -- карточка: подложка со скруглением, содержимое с отступом
+    local function beginCard(id, h)
+        imgui.PushStyleColor(imgui.Col.ChildBg, C_PANEL)
+        imgui.BeginChild(id, V2(0, h), false, imgui.WindowFlags.NoScrollbar)
+        imgui.SetCursorPos(V2(14, 12))
+        imgui.BeginGroup()
+    end
+
+    local function endCard()
+        imgui.EndGroup()
+        imgui.EndChild()
+        imgui.PopStyleColor(1)
+    end
+
+    local function cardTitle(text)
+        withFont(F.bold, function() imgui.TextColored(C_ACCENT, u8(text)) end)
+    end
+
+    local function statCard(id, caption, value, color, w)
+        imgui.PushStyleColor(imgui.Col.ChildBg, C_PANEL)
+        imgui.BeginChild(id, V2(w, 66), false, imgui.WindowFlags.NoScrollbar)
+        imgui.SetCursorPos(V2(12, 9))
+        imgui.TextDisabled(u8(caption))
+        imgui.SetCursorPos(V2(12, 30))
+        withFont(F.big, function() imgui.TextColored(color or C_TEXT, u8(value)) end)
+        imgui.EndChild()
+        imgui.PopStyleColor(1)
+    end
+
+    local function sectionTitle(text)
+        imgui.Dummy(V2(0, 2))
+        withFont(F.bold, function() imgui.TextColored(C_ACCENT, u8(text)) end)
+        local p = imgui.GetCursorScreenPos()
+        imgui.GetWindowDrawList():AddRectFilled(p, V2(p.x + contentWidth(), p.y + 1), u32(C_BORDER), 0)
+        imgui.Dummy(V2(0, 5))
+    end
+
+    local function statusInfo()
+        if state.phase == 'countdown' then
+            return string.format('ОТСЧЁТ %d', math.max(0, math.ceil(state.startAt - os.clock()))), C_ACCENT
+        elseif state.phase == 'running' then
+            return 'ФЛУД', C_GREEN
+        end
+        return 'ОЖИДАНИЕ', C_MUTED
+    end
+
+    local function rosterOnline(me)
+        local active, slot = 0, nil
+        for _, n in ipairs(roster.list) do
+            if ui.online[norm(n)] then
+                if me and norm(n) == norm(me) then slot = active end
+                active = active + 1
+            end
+        end
+        return active, slot
+    end
+
+    -- ------------------------- шапка и вкладки -------------------------
+    local function drawHeader()
+        local y0 = imgui.GetCursorPosY()
+        withFont(F.title, function()
+            neonText('AMARAYTHEN', C_NEON_CORE, C_ACCENT)
+            imgui.SameLine(0, 9)
+            imgui.TextColored(C_TEXT, 'CAPTER')
+        end)
+        imgui.TextDisabled(u8('by amaru  ·  v' .. thisScript().version))
+
+        -- состояние справа
+        local text, color = statusInfo()
+        text = u8(text)
+        imgui.SameLine(imgui.GetWindowWidth() - PAD - pillWidth(text, true) - 36)
+        imgui.SetCursorPosY(y0 + 4)
+        pill(text, color, true)
+
+        -- крестик закрытия
+        imgui.SameLine(imgui.GetWindowWidth() - PAD - 26)
+        imgui.SetCursorPosY(y0 + 1)
+        local p = imgui.GetCursorScreenPos()
+        local clicked = imgui.InvisibleButton('##close', V2(26, 26))
+        local hovered = imgui.IsItemHovered()
+        local dl = imgui.GetWindowDrawList()
+        if hovered then dl:AddRectFilled(p, V2(p.x + 26, p.y + 26), u32(C_RED, 0.22), 7) end
+        local xc = u32(hovered and C_RED or C_MUTED)
+        dl:AddLine(V2(p.x + 8, p.y + 8), V2(p.x + 18, p.y + 18), xc, 2)
+        dl:AddLine(V2(p.x + 18, p.y + 8), V2(p.x + 8, p.y + 18), xc, 2)
+        if clicked then ui.open[0] = false end
+
+        -- неоновая линия: яркая слева, гаснет к правому краю, со свечением
+        imgui.SetCursorPosY(math.max(imgui.GetCursorPosY(), y0 + 50))
+        local lp = imgui.GetCursorScreenPos()
+        local lw = contentWidth()
+        local k = pulse()
+        for i = 3, 1, -1 do
+            local a = u32(C_ACCENT, 0.09 * k / i)
+            local z = u32(C_ACCENT, 0)
+            dl:AddRectFilledMultiColor(V2(lp.x, lp.y - i * 1.5), V2(lp.x + lw, lp.y + 2 + i * 1.5), a, z, z, a)
+        end
+        dl:AddRectFilledMultiColor(lp, V2(lp.x + lw, lp.y + 2),
+            u32(C_NEON_CORE), u32(C_ACCENT, 0.15), u32(C_ACCENT, 0.15), u32(C_NEON_CORE))
+        imgui.Dummy(V2(0, 10))
+    end
 
     local function drawTabs()
+        local W = contentWidth()
+        local gap, inner, h = 4, 4, 30
+        local bw = (W - inner * 2 - gap * (#TABS - 1)) / #TABS
+        local p = imgui.GetCursorScreenPos()
+        imgui.GetWindowDrawList():AddRectFilled(p, V2(p.x + W, p.y + h + inner * 2), u32(C_PANEL), 10)
+        imgui.SetCursorScreenPos(V2(p.x + inner, p.y + inner))
         for i, name in ipairs(TABS) do
-            if i > 1 then imgui.SameLine() end
+            if i > 1 then imgui.SameLine(0, gap) end
             local active = ui.tab == i
-            if active then imgui.PushStyleColor(imgui.Col.Button, C_ACCENT) end
-            if imgui.Button(u8(name) .. '##tab' .. i, V2(101, 26)) then ui.tab = i end
-            if active then imgui.PopStyleColor(1) end
+            if active then
+                glowRect(imgui.GetCursorScreenPos(), bw, h, C_ACCENT, 7, 0.8)
+                imgui.PushStyleColor(imgui.Col.Button, C_ACCENT)
+                imgui.PushStyleColor(imgui.Col.ButtonHovered, C_ACCENT_HI)
+                imgui.PushStyleColor(imgui.Col.ButtonActive, C_ACCENT_HI)
+                imgui.PushStyleColor(imgui.Col.Text, C_ON_ACCENT)
+            else
+                imgui.PushStyleColor(imgui.Col.Button, V4(0, 0, 0, 0))
+                imgui.PushStyleColor(imgui.Col.ButtonHovered, C_PANEL_HI)
+                imgui.PushStyleColor(imgui.Col.ButtonActive, C_PANEL_HI)
+                imgui.PushStyleColor(imgui.Col.Text, C_MUTED)
+            end
+            withFont(F.bold, function()
+                if imgui.Button(u8(name) .. '##tab' .. i, V2(bw, h)) then ui.tab = i end
+            end)
+            imgui.PopStyleColor(4)
         end
+        imgui.SetCursorScreenPos(V2(p.x, p.y + h + inner * 2))
+        imgui.Dummy(V2(0, 6))
     end
 
+    -- ----------------------------- вкладки -----------------------------
     local function drawLaunchTab()
         refreshOnline()
         local me = myNick() or '?'
         local leader = isLeader(me)
+        local W = contentWidth()
 
-        imgui.Text(u8('Ник: ') .. me)
-        if leader then
-            imgui.SameLine()
-            textColored(C_ACCENT, '(лидер)')
-        end
+        -- кто я
+        withFont(F.bold, function() imgui.Text(me) end)
+        imgui.SameLine(0, 10)
+        pill(u8(leader and 'ЛИДЕР' or 'УЧАСТНИК'), leader and C_ACCENT or C_MUTED, false)
+        local ptxt = u8(string.format('пинг %d мс', myPing()))
+        imgui.SameLine(imgui.GetWindowWidth() - PAD - imgui.CalcTextSize(ptxt).x)
+        imgui.TextDisabled(ptxt)
+        imgui.Dummy(V2(0, 2))
 
-        if state.phase == 'idle' then
-            imgui.Text(u8'Состояние: ожидание')
-        elseif state.phase == 'countdown' then
-            textColored(C_ACCENT, string.format('Состояние: отсчёт, старт через %d с',
-                math.max(0, math.ceil(state.startAt - os.clock()))))
+        -- карточки
+        local active, slot = rosterOnline(me)
+        local cw = (W - 16) / 3
+        statCard('##st1', 'В СЕТИ', string.format('%d / %d', active, #roster.list),
+            active > 0 and C_GREEN or C_MUTED, cw)
+        imgui.SameLine(0, 8)
+        statCard('##st2', 'ТВОЙ СЛОТ', slot and tostring(slot + 1) or '-', slot and C_ACCENT or C_MUTED, cw)
+        imgui.SameLine(0, 8)
+        statCard('##st3', 'ВЕРСИЯ', roster.version > 0 and ('v' .. roster.version) or '-', C_TEXT, cw)
+        imgui.Dummy(V2(0, 2))
+
+        -- что происходит сейчас
+        if state.phase == 'countdown' then
+            local left = math.max(0, state.startAt - os.clock())
+            local total = math.max(0.001, state.startAt - state.codeAt)
+            withFont(F.bold, function()
+                imgui.TextColored(C_ACCENT, u8(string.format('Старт через %d с  ·  ведёт %s', math.ceil(left), state.leader)))
+            end)
+            imgui.ProgressBar(1 - left / total, V2(W, 6), '')
+        elseif state.phase == 'running' then
+            withFont(F.bold, function()
+                imgui.TextColored(C_GREEN, u8(string.format('Флуд идёт  ·  отправлено %d  ·  слот %d из %d',
+                    state.sent, state.slot + 1, state.active)))
+            end)
+            imgui.PushStyleColor(imgui.Col.PlotHistogram, C_GREEN)
+            local total = math.max(1, state.stopAt - state.startAt)
+            imgui.ProgressBar(math.min(1, math.max(0, (os.clock() - state.startAt) / total)), V2(W, 6), '')
+            imgui.PopStyleColor(1)
         else
-            textColored(C_GREEN, string.format('Состояние: флуд идёт, отправлено %s: %d', CFG.flood_cmd, state.sent))
+            imgui.TextDisabled(u8(leader and 'Готов к запуску.' or 'Ждём команду лидера.'))
         end
-        if state.phase ~= 'idle' then
-            imgui.TextWrapped(u8(string.format('Лидер %s, задержка %d мс, слот %d из %d',
-                state.leader, state.delay, state.slot + 1, state.active)))
-        end
+        imgui.Dummy(V2(0, 2))
 
-        local active, slot = 0, nil
-        for _, n in ipairs(roster.list) do
-            if ui.online[norm(n)] then
-                if norm(n) == norm(me) then slot = active end
-                active = active + 1
-            end
-        end
-        imgui.TextWrapped(u8(string.format('Ростер v%d: в сети %d из %d, твой слот: %s',
-            roster.version, active, #roster.list, slot and tostring(slot + 1) or 'нет')))
-
-        imgui.Separator()
+        local fh = imgui.GetFrameHeightWithSpacing()
+        local th = imgui.GetTextLineHeightWithSpacing()
         if leader then
-            imgui.PushItemWidth(160)
+            beginCard('##leader', 12 + th + fh * 2 + th + 8 + 42 + 14)
+            cardTitle('ПАНЕЛЬ ЛИДЕРА')
+            imgui.PushItemWidth(180)
             if imgui.InputInt(u8'Задержка, мс', ui.delay, 10, 100) then
                 ui.delay[0] = math.max(CFG.min_delay, math.min(CFG.max_delay, ui.delay[0]))
             end
@@ -1063,119 +1207,116 @@ if hasImgui then
             if active > 0 then
                 imgui.TextDisabled(u8(string.format('Шаг волны: %d / %d = %.0f мс между %s',
                     ui.delay[0], active, ui.delay[0] / active, CFG.flood_cmd)))
+            else
+                imgui.TextDisabled(u8'Из списка сейчас никого нет в сети.')
             end
-            imgui.Spacing()
-            if imgui.Button(u8'ЗАПУСТИТЬ', V2(205, 36)) then
+            imgui.Dummy(V2(0, 2))
+            local bw = (W - 28 - 8) / 2
+            glowRect(imgui.GetCursorScreenPos(), bw, 42, C_ACCENT, 7, 1)
+            if colorButton(u8'ЗАПУСТИТЬ', bw, 42, C_ACCENT, C_ACCENT_HI, C_ON_ACCENT) then
                 leaderStart(ui.delay[0], ui.countdown[0])
             end
-            imgui.SameLine()
-            if imgui.Button(u8'ОСТАНОВИТЬ ВСЕХ', V2(205, 36)) then
+            imgui.SameLine(0, 8)
+            if colorButton(u8'СТОП ВСЕМ', bw, 42, C_RED_BG, C_RED, C_TEXT) then
                 leaderStop()
             end
+            endCard()
         else
-            imgui.TextWrapped(u8'Флуд запускает лидер. Остановить его ты можешь только у себя.')
-            if imgui.Button(u8'Остановить у себя', V2(205, 32)) then
+            beginCard('##member', 12 + th * 4 + 8 + 38 + 14)
+            cardTitle('УЧАСТНИК')
+            mutedWrapped('Флуд запускает лидер. Скрипт сам встанет в волну в свою очередь, ' ..
+                'а остановить его ты можешь только у себя.')
+            imgui.Dummy(V2(0, 2))
+            if colorButton(u8'Остановить у себя', W - 28, 38, C_RED_BG, C_RED, C_TEXT) then
                 stopFlood('остановлено вручную')
             end
+            endCard()
         end
 
-        imgui.Separator()
+        imgui.Dummy(V2(0, 2))
         ui.debug[0] = CFG.debug
-        if imgui.Checkbox(u8'Отладка: показывать строки с кодом в чате', ui.debug) then
-            CFG.debug = ui.debug[0]
-        end
+        if imgui.Checkbox(u8'Отладка в чате', ui.debug) then CFG.debug = ui.debug[0] end
     end
 
-    -- список ников: online-статус, перестановка и удаление
-    local function drawNickList(list, id, editable, reorder)
-        imgui.BeginChild('##list' .. id, V2(0, 200), true)
-        if #list == 0 then imgui.TextDisabled(u8'Список пуст') end
-        local move, remove
+    -- строки списка: точка «в сети», номер, ник, метки справа
+    local function drawNickRows(list, me, emptyText, height)
+        imgui.PushStyleColor(imgui.Col.ChildBg, C_PANEL)
+        imgui.BeginChild('##rows' .. ui.tab, V2(0, height), false)
+        imgui.Dummy(V2(0, 4))
+        if #list == 0 then
+            imgui.SetCursorPosX(14)
+            imgui.TextDisabled(u8(emptyText))
+        end
+        local dl = imgui.GetWindowDrawList()
+        local rowW = imgui.GetWindowWidth() - 12
+        local rowH = imgui.GetTextLineHeight() + 12
         for i, n in ipairs(list) do
             local on = ui.online[norm(n)]
-            imgui.Text(string.format('%2d.', i))
-            imgui.SameLine()
-            imgui.TextColored(on and C_GREEN or C_GREY, n)
-            imgui.SameLine(215)
-            textColored(on and C_GREEN or C_GREY, on and 'в сети' or 'не в сети')
-            if editable then
-                if reorder then
-                    imgui.SameLine(318)
-                    if imgui.Button('^##u' .. id .. i, V2(24, 0)) and i > 1 then move = { i, i - 1 } end
-                    imgui.SameLine()
-                    if imgui.Button('v##d' .. id .. i, V2(24, 0)) and i < #list then move = { i, i + 1 } end
-                end
-                imgui.SameLine(378)
-                if imgui.Button('X##x' .. id .. i, V2(24, 0)) then remove = i end
+            local isMe = me and norm(n) == norm(me)
+            local p = imgui.GetCursorScreenPos()
+            local x0 = p.x + 6
+            if isMe then
+                dl:AddRectFilled(V2(x0, p.y), V2(x0 + rowW, p.y + rowH), u32(C_ACCENT, 0.10), 7)
             end
+            dl:AddCircleFilled(V2(x0 + 13, p.y + rowH / 2), 4, on and u32(C_GREEN) or u32(C_MUTED, 0.5), 12)
+            imgui.SetCursorScreenPos(V2(x0 + 26, p.y + 6))
+            imgui.TextDisabled(tostring(i))
+            imgui.SetCursorScreenPos(V2(x0 + 50, p.y + 6))
+            imgui.TextColored(on and C_TEXT or C_MUTED, n)
+
+            local badges = {}
+            if isLeader(n) then badges[#badges + 1] = { u8'лидер', C_ACCENT } end
+            if isMe then badges[#badges + 1] = { u8'ты', C_GREEN } end
+            local bx = x0 + rowW - 8
+            for _, b in ipairs(badges) do
+                bx = bx - pillWidth(b[1], false)
+                imgui.SetCursorScreenPos(V2(bx, p.y + 3))
+                pill(b[1], b[2], false)
+                bx = bx - 6
+            end
+
+            imgui.SetCursorScreenPos(p)
+            imgui.Dummy(V2(rowW, rowH))
         end
         imgui.EndChild()
-        if move then
-            list[move[1]], list[move[2]] = list[move[2]], list[move[1]]
-            ui.dirty = true
-        end
-        if remove then
-            table.remove(list, remove)
-            ui.dirty = true
-        end
+        imgui.PopStyleColor(1)
     end
 
-    local function drawAddRow(list, buf, id)
-        imgui.PushItemWidth(200)
-        imgui.InputText('##add' .. id, buf, ffi.sizeof(buf))
-        imgui.PopItemWidth()
-        imgui.SameLine()
-        if imgui.Button(u8'Добавить##' .. id, V2(100, 0)) then
-            local nick, err = resolveNickInput(ffi.string(buf))
-            if not nick then
-                setNotice(err, true)
-            elseif listHas(list, nick) then
-                setNotice(nick .. ' уже в списке.', true)
-            else
-                table.insert(list, nick)
-                imgui.StrCopy(buf, '')
-                ui.dirty = true
-                setNotice('Добавлен ' .. nick .. '. Не забудь сохранить.')
-            end
-        end
-        imgui.TextDisabled(u8'Можно ввести ник или ID игрока на сервере.')
+    local function drawListHeader(title, count, total)
+        withFont(F.bold, function() imgui.Text(u8(title)) end)
+        local txt = u8(string.format('в сети %d из %d', count, total))
+        imgui.SameLine(imgui.GetWindowWidth() - PAD - pillWidth(txt, true))
+        pill(txt, count > 0 and C_GREEN or C_MUTED, true)
     end
 
     local function drawRosterTab()
         refreshOnline()
-        if CFG.roster_url ~= '' then
-            imgui.TextWrapped(u8(string.format('Ростер v%d, %d ников. Порядок в списке = очерёдность в волне.',
-                roster.version, #roster.list)))
-            wrappedColored(C_ACCENT, 'Список общий и обновляется сам по ссылке. Менять его нужно в репозитории на GitHub.')
-            drawNickList(roster.list, 'remote', false, false)
-            if imgui.Button(u8'Обновить сейчас', V2(205, 26)) then loadRemoteRoster(true) end
-            return
-        end
-        imgui.TextWrapped(u8(string.format('Ростер v%d. Порядок в списке = очерёдность в волне, у всех он должен быть одинаковым.',
-            CFG.roster_version)))
-        local editable = state.phase == 'idle'
-        drawNickList(ui.roster, 'roster', editable, true)
-        if editable then drawAddRow(ui.roster, ui.addRoster, 'roster') end
+        local me = myNick()
+        local active = rosterOnline(me)
+        drawListHeader(roster.version > 0 and string.format('Список  ·  v%d', roster.version) or 'Список',
+            active, #roster.list)
+        mutedWrapped('Порядок в списке - очерёдность в волне. Список общий для состава и обновляется сам.')
+        imgui.Dummy(V2(0, 2))
+        drawNickRows(roster.list, me, 'Список ещё не загружен.', 318)
+        imgui.Dummy(V2(0, 2))
+        if imgui.Button(u8'Обновить список', V2(contentWidth(), 32)) then loadRemoteRoster(true) end
     end
 
     local function drawLeadersTab()
         refreshOnline()
-        if CFG.roster_url ~= '' then
-            imgui.TextWrapped(u8'Лидеры могут запускать и останавливать флуд.')
-            wrappedColored(C_ACCENT, roster.leaders
-                and 'Лидеры задаются в общем списке на GitHub (секция [leaders]). Здесь их изменить нельзя.'
-                or 'В общем списке нет секции [leaders] - действуют лидеры, встроенные в скрипт.')
-            drawNickList(leaderList(), 'remoteleaders', false, false)
-            return
-        end
-        imgui.TextWrapped(u8'Лидеры могут запускать и останавливать флуд. Список должен совпадать у всех, иначе команду лидера не примут.')
-        local editable = state.phase == 'idle'
-        drawNickList(ui.leaders, 'leaders', editable, false)
-        if editable then drawAddRow(ui.leaders, ui.addLeader, 'leaders') end
+        local me = myNick()
+        local list = leaderList()
+        local on = 0
+        for _, n in ipairs(list) do if ui.online[norm(n)] then on = on + 1 end end
+        drawListHeader('Лидеры', on, #list)
+        mutedWrapped('Только лидеры могут запускать и останавливать флуд. Список задаётся руководством состава.')
+        imgui.Dummy(V2(0, 2))
+        drawNickRows(list, me, 'Лидеров нет.', 360)
     end
 
     local function drawSettingsTab()
-        imgui.PushItemWidth(170)
+        sectionTitle('ЗАПУСК')
+        imgui.PushItemWidth(180)
         if imgui.InputText(u8'Чат управления', ui.chatCmd, ffi.sizeof(ui.chatCmd)) then ui.dirty = true end
         if imgui.InputInt(u8'Отсчёт по умолчанию, с', ui.defCd, 1, 5) then
             ui.defCd[0] = math.max(0, math.min(30, ui.defCd[0]))
@@ -1186,89 +1327,109 @@ if hasImgui then
             ui.dirty = true
         end
         imgui.PopItemWidth()
-        if imgui.Checkbox(u8'Прятать «будет доступна через несколько секунд»', ui.hide) then ui.dirty = true end
+
+        sectionTitle('ПОВЕДЕНИЕ')
         if imgui.Checkbox(u8'Поправка на пинг (рекомендуется)', ui.ping) then ui.dirty = true end
+        if imgui.Checkbox(u8'Прятать «будет доступна через несколько секунд»', ui.hide) then ui.dirty = true end
+
+        sectionTitle('ОБНОВЛЕНИЯ')
         if imgui.Checkbox(u8'Автообновление скрипта', ui.autoUpd) then ui.dirty = true end
-        imgui.SameLine()
-        if imgui.Button(u8'Проверить сейчас', V2(150, 0)) then
-            setNotice('Проверяю обновления (у тебя v' .. thisScript().version .. ')...')
+        imgui.TextDisabled(u8('Установлена версия v' .. thisScript().version))
+        imgui.Dummy(V2(0, 2))
+        local bw = (contentWidth() - 8) / 2
+        if imgui.Button(u8'Проверить обновления', V2(bw, 32)) then
+            setNotice('Проверяю обновления...')
             checkForUpdate(true)
         end
-        imgui.Spacing()
-        imgui.Text(u8'Ссылка на ростер:')
-        imgui.PushItemWidth(-1)
-        if imgui.InputText('##url', ui.url, ffi.sizeof(ui.url)) then ui.dirty = true end
-        imgui.PopItemWidth()
-        imgui.TextDisabled(u8'Пусто - общий список с GitHub (встроен в скрипт).')
-        imgui.TextDisabled(u8'off - не скачивать, брать список из вкладки «Ростер».')
-        imgui.TextWrapped(u8('Сейчас: ' .. (CFG.roster_url ~= '' and CFG.roster_url or 'список из конфига')))
+        imgui.SameLine(0, 8)
+        if imgui.Button(u8'Перечитать конфиг', V2(bw, 32)) then
+            if reloadAll() then setNotice('Конфиг перечитан.') end
+        end
     end
 
     local function drawFooter()
-        imgui.Separator()
         if ui.dirty then
-            if not sameList(ui.roster, CFG.roster) then
-                wrappedColored(C_ACCENT, string.format('Есть несохранённые изменения. После сохранения ростер станет v%d.',
-                    CFG.roster_version + 1))
-            else
-                wrappedColored(C_ACCENT, 'Есть несохранённые изменения.')
-            end
-            if imgui.Button(u8'Сохранить в конфиг', V2(205, 28)) then saveFromUi() end
-            imgui.SameLine()
-            if imgui.Button(u8'Отменить', V2(205, 28)) then
+            imgui.Dummy(V2(0, 6))
+            mutedWrapped('Есть несохранённые изменения.')
+            local bw = (contentWidth() - 8) / 2
+            if colorButton(u8'Сохранить', bw, 34, C_ACCENT, C_ACCENT_HI, C_ON_ACCENT) then saveFromUi() end
+            imgui.SameLine(0, 8)
+            if imgui.Button(u8'Отменить', V2(bw, 34)) then
                 syncUi()
                 setNotice('Изменения отменены.')
             end
-        else
-            if imgui.Button(u8'Перечитать конфиг', V2(205, 28)) then
-                if reloadAll() then setNotice('Конфиг перечитан.') end
-            end
-            imgui.SameLine()
-            if imgui.Button(u8'Закрыть', V2(205, 28)) then ui.open[0] = false end
         end
         if ui.notice and os.clock() - ui.noticeAt < 8 then
+            imgui.Dummy(V2(0, 4))
             wrappedColored(ui.noticeErr and C_RED or C_GREEN, ui.notice)
         end
     end
 
+    -- ------------------------------ тема -------------------------------
     local function applyTheme()
-        local style = imgui.GetStyle()
-        local c, col = style.Colors, imgui.Col
-        style.WindowRounding   = 6.0
-        style.FrameRounding    = 4.0
-        style.ChildRounding    = 4.0
-        style.WindowTitleAlign = V2(0.5, 0.5)
-        c[col.Text]             = V4(0.92, 0.92, 0.92, 1.00)
-        c[col.TextDisabled]     = V4(0.55, 0.55, 0.55, 1.00)
-        c[col.WindowBg]         = V4(0.10, 0.10, 0.11, 0.97)
-        c[col.ChildBg]          = V4(0.13, 0.13, 0.14, 1.00)
-        c[col.Border]           = V4(0.30, 0.30, 0.31, 1.00)
-        c[col.FrameBg]          = V4(0.20, 0.20, 0.21, 1.00)
-        c[col.FrameBgHovered]   = V4(0.27, 0.27, 0.28, 1.00)
-        c[col.FrameBgActive]    = V4(0.32, 0.32, 0.33, 1.00)
-        c[col.TitleBg]          = V4(0.16, 0.16, 0.17, 1.00)
-        c[col.TitleBgActive]    = V4(0.20, 0.20, 0.21, 1.00)
-        c[col.Button]           = V4(0.24, 0.24, 0.25, 1.00)
-        c[col.ButtonHovered]    = V4(0.55, 0.45, 0.12, 1.00)
-        c[col.ButtonActive]     = V4(0.79, 0.64, 0.15, 1.00)
-        c[col.CheckMark]        = V4(0.79, 0.64, 0.15, 1.00)
-        c[col.SliderGrab]       = V4(0.70, 0.57, 0.14, 1.00)
-        c[col.SliderGrabActive] = V4(0.79, 0.64, 0.15, 1.00)
-        c[col.Separator]        = V4(0.30, 0.30, 0.31, 1.00)
-        c[col.TextSelectedBg]   = V4(0.55, 0.45, 0.12, 0.60)
+        local s = imgui.GetStyle()
+        local c, col = s.Colors, imgui.Col
+        s.WindowPadding     = V2(PAD, 14)
+        s.FramePadding      = V2(8, 5)
+        s.ItemSpacing       = V2(8, 7)
+        s.ItemInnerSpacing  = V2(6, 4)
+        s.WindowRounding    = 12
+        s.ChildRounding     = 10
+        s.FrameRounding     = 7
+        s.GrabRounding      = 7
+        s.PopupRounding     = 8
+        s.ScrollbarSize     = 10
+        s.ScrollbarRounding = 8
+        s.GrabMinSize       = 12
+        s.WindowBorderSize  = 1
+        s.ChildBorderSize   = 0
+        s.FrameBorderSize   = 0
+        c[col.Text]                 = C_TEXT
+        c[col.TextDisabled]         = C_MUTED
+        c[col.WindowBg]             = C_WINDOW
+        c[col.ChildBg]              = C_PANEL
+        c[col.PopupBg]              = V4(0.08, 0.085, 0.10, 0.98)
+        c[col.Border]               = V4(1.00, 0.76, 0.03, 0.45) -- неоновая рамка окна
+        c[col.FrameBg]              = V4(0.14, 0.145, 0.18, 1.00)
+        c[col.FrameBgHovered]       = V4(0.19, 0.195, 0.24, 1.00)
+        c[col.FrameBgActive]        = V4(0.24, 0.20, 0.08, 1.00)
+        c[col.Button]               = V4(0.15, 0.155, 0.19, 1.00)
+        c[col.ButtonHovered]        = V4(0.24, 0.21, 0.10, 1.00)
+        c[col.ButtonActive]         = V4(0.36, 0.29, 0.06, 1.00)
+        c[col.CheckMark]            = C_ACCENT
+        c[col.SliderGrab]           = C_ACCENT
+        c[col.SliderGrabActive]     = C_ACCENT_HI
+        c[col.Separator]            = C_BORDER
+        c[col.PlotHistogram]        = C_ACCENT
+        c[col.ScrollbarBg]          = V4(0, 0, 0, 0)
+        c[col.ScrollbarGrab]        = V4(0.25, 0.255, 0.29, 1.00)
+        c[col.ScrollbarGrabHovered] = V4(0.32, 0.325, 0.36, 1.00)
+        c[col.ScrollbarGrabActive]  = C_ACCENT
+        c[col.TextSelectedBg]       = V4(0.79, 0.64, 0.15, 0.35)
+    end
+
+    -- первый найденный шрифт Windows из списка
+    local function pickFont(names)
+        local dir = getFolderPath(0x14)
+        for _, n in ipairs(names) do
+            local path = dir .. '\\' .. n
+            if doesFileExist(path) then return path end
+        end
     end
 
     imgui.OnInitialize(function()
         local io_ = imgui.GetIO()
         io_.IniFilename = nil
-        -- шрифт с кириллицей, иначе вместо русских букв будут знаки вопроса
-        local fonts = getFolderPath(0x14)
-        local font = fonts .. '\\trebucbd.ttf'
-        if not doesFileExist(font) then font = fonts .. '\\arial.ttf' end
-        if doesFileExist(font) then
+        -- шрифты с кириллицей, иначе вместо русских букв будут знаки вопроса
+        local regular = pickFont({ 'segoeui.ttf', 'trebuc.ttf', 'arial.ttf' })
+        local bold = pickFont({ 'segoeuib.ttf', 'trebucbd.ttf', 'arialbd.ttf' }) or regular
+        if regular then
             local ranges = io_.Fonts:GetGlyphRangesCyrillic()
             io_.Fonts:Clear()
-            io_.Fonts:AddFontFromFileTTF(font, 15.0, nil, ranges)
+            F.body  = io_.Fonts:AddFontFromFileTTF(regular, 16.0, nil, ranges)
+            F.bold  = io_.Fonts:AddFontFromFileTTF(bold, 16.0, nil, ranges)
+            F.title = io_.Fonts:AddFontFromFileTTF(bold, 22.0, nil, ranges)
+            F.big   = io_.Fonts:AddFontFromFileTTF(bold, 24.0, nil, ranges)
         end
         pcall(applyTheme)
     end)
@@ -1278,10 +1439,22 @@ if hasImgui then
         function(player)
             local sw, sh = getScreenResolution()
             imgui.SetNextWindowPos(V2(sw / 2, sh / 2), imgui.Cond.FirstUseEver, V2(0.5, 0.5))
-            imgui.SetNextWindowSize(V2(450, 480), imgui.Cond.FirstUseEver)
-            if imgui.Begin('SF Capture v' .. thisScript().version .. '##sfmain', ui.open, imgui.WindowFlags.NoCollapse) then
+            imgui.SetNextWindowSize(V2(480, 610), imgui.Cond.Always)
+            local flags = imgui.WindowFlags.NoTitleBar + imgui.WindowFlags.NoResize + imgui.WindowFlags.NoCollapse
+            if imgui.Begin('AMARAYTHEN Capter##sfmain', ui.open, flags) then
+                -- неоновый ореол вокруг окна (рисуется позади всех окон)
+                pcall(function()
+                    local pos, size = imgui.GetWindowPos(), imgui.GetWindowSize()
+                    local bg = imgui.GetBackgroundDrawList()
+                    local k = pulse()
+                    for i = 6, 1, -1 do
+                        local e = i * 3
+                        bg:AddRectFilled(V2(pos.x - e, pos.y - e), V2(pos.x + size.x + e, pos.y + size.y + e),
+                            u32(C_ACCENT, 0.035 * k), 12 + e)
+                    end
+                end)
+                drawHeader()
                 drawTabs()
-                imgui.Separator()
                 if ui.tab == 1 then
                     drawLaunchTab()
                 elseif ui.tab == 2 then
@@ -1303,7 +1476,7 @@ local function menuOpen()
 end
 
 -- ----------------------------- команды -----------------------------
-local HELP = '/sf - меню, /sf start <мс> [отсчёт], /sf stop, /sf status, /sf list, /sf reload, /sf update'
+local HELP = '/ac - меню, /ac start <мс> [отсчёт], /ac stop, /ac status, /ac list, /ac reload, /ac update'
 
 local function cmdSf(arg)
     local cmd, a1, a2 = (arg or ''):match('^%s*(%S*)%s*(%S*)%s*(%S*)')
@@ -1321,7 +1494,7 @@ local function cmdSf(arg)
     elseif cmd == 'start' then
         local delay = tonumber(a1)
         if not delay then
-            msg('Использование: /sf start <задержка мс> [отсчёт с]')
+            msg('Использование: /ac start <задержка мс> [отсчёт с]')
             return
         end
         leaderStart(delay, tonumber(a2) or CFG.default_countdown)
@@ -1335,7 +1508,7 @@ local function cmdSf(arg)
 
     elseif cmd == 'status' then
         local slot, active = computeSlot()
-        msg(string.format('Ник: %s%s. Ростер v%d: онлайн %d из %d, твой слот: %s. Состояние: %s.',
+        msg(string.format('Ник: %s%s. Список v%d: онлайн %d из %d, твой слот: %s. Состояние: %s.',
             me ~= '' and me or '?', isLeader(me) and ' (лидер)' or '',
             roster.version, active, #roster.list, slot and tostring(slot + 1) or 'нет',
             PHASE_NAME[state.phase]))
@@ -1347,7 +1520,7 @@ local function cmdSf(arg)
     elseif cmd == 'list' then
         local leaders = leaderList()
         msg('Лидеры: ' .. (#leaders > 0 and table.concat(leaders, ', ') or 'нет'))
-        msg(string.format('Ростер v%d (%d):', roster.version, #roster.list))
+        msg(string.format('Список v%d (%d):', roster.version, #roster.list))
         local line = ''
         for i, n in ipairs(roster.list) do
             local item = string.format('%d. %s%s', i, n, isOnline(n) and '' or ' (офф)')
@@ -1428,18 +1601,17 @@ function main()
     if not isSampLoaded() or not isSampfuncsLoaded() then return end
     while not isSampAvailable() do wait(100) end
 
-    sampRegisterChatCommand('sf', cmdSf)
+    sampRegisterChatCommand('ac', cmdSf)
     loadConfig(false)
-    if CFG.roster_url ~= '' then
+    if roster.version > 0 then
         msg(string.format('v%s загружен. Общий список v%d (%d ников, лидеров %d), проверяю обновления...',
             thisScript().version, roster.version, #roster.list, #leaderList()))
     else
-        msg(string.format('v%s загружен: лидеров %d, ростер v%d - %d ников.',
-            thisScript().version, #CFG.leaders, roster.version, #roster.list))
+        msg(string.format('v%s загружен, скачиваю общий список...', thisScript().version))
     end
     loadRemoteRoster(true)
     if hasImgui then
-        msg('Меню: /sf. ' .. HELP)
+        msg('Меню: /ac. ' .. HELP)
     else
         msg('{FF6060}mimgui не найдена - меню недоступно, работают команды.')
         msg(HELP)
@@ -1465,7 +1637,7 @@ function main()
         end
 
         -- общий ростер перепроверяется сам, пока нет флуда
-        if CFG.roster_url ~= '' and state.phase == 'idle' and not rosterLoading
+        if state.phase == 'idle' and not rosterLoading
             and now - rosterCheckedAt > CFG.roster_refresh then
             loadRemoteRoster(false)
         end
