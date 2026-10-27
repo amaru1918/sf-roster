@@ -1,8 +1,9 @@
-5
+6
 [leaders]
 Escay_Eastwood
 Karl_Branting
 Amaru_Noster
+Tatsuki_Sunsetik
 [roster]
 Escay_Eastwood
 Amaru_Noster
