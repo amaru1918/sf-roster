@@ -1,6 +1,6 @@
 script_name('AMARAYTHEN Capter')
 script_author('amaru')
-script_version('3.1')
+script_version('3.2')
 script_description('AMARAYTHEN Capter by amaru: синхронный флуд /capture волной. Запуск лидером через /fc.')
 -- Совместимость с автообновлением v1.8-v1.9, которые ищут в новом файле прежнее имя.
 -- Не удалять: script_name('SF Capture')
@@ -20,17 +20,27 @@ if hasImgui then
     u8 = encoding.UTF8
 end
 
--- Ростер и лидеры берутся только из общего списка на GitHub (ссылка ниже, менять её
--- может только тот, кто выпускает скрипт). В конфиге moonloader\config\sf_capture.ini
--- хранятся лишь личные настройки игрока. Значения ниже - запасные.
+-- Скрипт работает только у участников нашей беседы в ВК или в Telegram. Бот беседы даёт код,
+-- /ac code <код> обменивает его на личный ключ, привязанный к нику (moonloader\config\sf_access.txt).
+-- Ключ действует, пока его хозяин в беседе; без него скрипт не участвует в волнах и ничего не запускает.
+-- Ростер, лидеры и обновления отдаёт сервер доступа из закрытого репозитория на GitHub, и тоже
+-- только по ключу. В конфиге moonloader\config\sf_capture.ini хранятся лишь личные настройки
+-- игрока. Значения ниже - запасные.
 
 -- ============================ НАСТРОЙКИ ============================
 local CFG = {
-    -- Репозиторий, где лежат общий список (ростер и лидеры) и сам скрипт для автообновления.
+    -- Закрытый репозиторий с общим списком (ростер и лидеры) и самим скриптом; файлы из него
+    -- отдаёт сервер доступа. По адресу репозитория подписана сохранённая у игрока копия списка.
     github          = { owner = 'amaru1918', repo = 'sf-roster', branch = 'main' },
     roster_path     = 'sf_roster.txt',
     script_path     = 'sf_capture.lua',
-    roster_refresh  = 600,        -- как часто перепроверять список, с (когда нет флуда); реже - бережём лимит API GitHub
+    roster_refresh  = 600,        -- как часто перепроверять список, с (когда нет флуда)
+
+    -- Сервер доступа (capter-gate): проверяет, что игрок в беседе, и раздаёт файлы по ключу.
+    gate            = 'https://capter-gate.ultrasonline.workers.dev',
+    gate_hint       = 'Telegram @script_amaraythen_bot или ВК vk.com/club175987243',   -- куда писать за кодом
+    access_recheck  = 1800,       -- как часто перепроверять ключ, с
+    access_grace    = 86400,      -- сколько скрипт работает без связи с сервером после последней удачной проверки, с
     sync_cooldown   = 5,          -- не чаще раза в N секунд выполнять «обновить у всех»
     -- Лидеры, пока общий список ещё ни разу не скачан или в нём нет секции [leaders].
     default_leaders = { 'Escay_Eastwood' },
@@ -519,12 +529,12 @@ local function scanReport(since)
     local nl = presentNicks(map, since, 'nl')
     if #nl > 0 then
         msgNicks(string.format('{FFB040}Скрипт есть, но тебя лидером не видят (%d):{CFCFCF}', #nl), nl)
-        msg('У них не скачался список лидеров с GitHub - в волну не попадут. Пусть наберут /ac reload.')
+        msg('У них не скачался общий список лидеров - в волну не попадут. Пусть наберут /ac reload.')
     end
     local silent = silentRosterNicks(map, since)
     if #silent > 0 then
         msgNicks(string.format('{FFB040}Из списка состава в сети, но молчат (%d):{CFCFCF}', #silent), silent)
-        msg('Причины: нет скрипта, свёрнута игра или версия до 3.0 без списка лидеров с GitHub.')
+        msg('Причины: нет скрипта или доступа к нему, свёрнута игра или версия до 3.0.')
         msg('Проверь у них /ac - вкладка «Лидеры»: если тебя там нет, дело в списке.')
     end
     return #present + 1
@@ -586,6 +596,7 @@ end
 
 local loadRemoteRoster  -- объявлены ниже, в разделе "ростер"
 local applyCachedRoster
+local hasAccess         -- объявлена ниже, в разделе "доступ"
 
 -- Общая настройка волны по готовым слоту и числу участников.
 -- codeAt - когда пришёл код запуска (если подключаемся с опозданием).
@@ -759,7 +770,7 @@ local function listFailedNotice(sender, what)
     if os.clock() - lastListFailNoticeAt < 60 then return end
     lastListFailNoticeAt = os.clock()
     msg(string.format('{FF6060}%s %s, но его нет в твоём списке лидеров, а свежий список не скачался.', sender, what))
-    msg('{FF6060}Проверь доступ к github.com и набери /ac reload.')
+    msg('{FF6060}Проверь интернет и набери /ac reload.')
     msgNicks('Лидеры у тебя сейчас:', leaderList())
 end
 
@@ -802,6 +813,8 @@ local function catchUpAndStart(sender, delay, cd, ver, hash)
 end
 
 local function handleCode(clean, codePos)
+    -- без доступа служебные строки не трогаем: ни отклика, ни участия в волне
+    if not hasAccess() then return false end
     local head   = clean:sub(1, codePos - 1)
     local rest   = clean:sub(codePos + #CFG.code_prefix)
     local sender = detectSender(head)
@@ -956,7 +969,7 @@ local function buildConfigText(o)
         'auto_update = ' .. tostring(o.auto_update ~= false),
         '',
         '; Автоопределение участников: в волне те, кто со скриптом и в сети.',
-        '; false - брать участников из списка состава на GitHub (true/false)',
+        '; false - брать участников из общего списка состава (true/false)',
         'auto_discovery = ' .. tostring(o.auto_discovery ~= false),
     }
     return table.concat(L, '\n') .. '\n'
@@ -1120,10 +1133,8 @@ local function saveRosterCache(content)
     f:close()
 end
 
--- ---------------------- скачивание с GitHub ------------------------
--- Прямые ссылки raw.githubusercontent.com GitHub кэширует до 5 минут, поэтому файлы берутся
--- через API GitHub: он отдаёт свежую версию сразу. Если API не ответил (например, исчерпан
--- лимит запросов), файл берётся по прямой ссылке.
+-- ---------------------------- скачивание ----------------------------
+-- Всё скачивается с сервера доступа: проверка ключа, общий список, обновления.
 
 local httpSeq = 0
 
@@ -1236,75 +1247,190 @@ local function pollDownloads(now)
     end
 end
 
-local B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
-local B64_INDEX = {}
-for i = 1, 64 do B64_INDEX[B64:byte(i)] = i - 1 end
+-- ------------------------------ доступ ------------------------------
+-- Ключ хранится в config\sf_access.txt вместе с ником, к которому привязан, и временем последнего
+-- «ok» от сервера. Сервер не ответил - скрипт работает по последней удачной проверке ещё
+-- access_grace секунд; сервер отказал (вышел из беседы, чужой ник) - доступ закрыт сразу.
+-- Всё про доступ собрано в одну таблицу: в главном блоке скрипта LuaJIT допускает не больше
+-- 200 локальных имён, и запас почти исчерпан.
+local access = {
+    token     = nil,
+    nick      = nil,     -- ник, к которому привязан ключ
+    okAt      = nil,     -- os.time() последнего «ok» от сервера
+    denied    = nil,     -- причина последнего отказа: token | nick | left
+    checking  = false,
+    checkedAt = -1e9,    -- os.clock() последней проверки
+    DENIED = {
+        token = 'ключ не принят сервером, нужен новый код',
+        nick  = 'ключ выдан на другой ник',
+        left  = 'тебя нет в нашей беседе ни в ВК, ни в Telegram',
+    },
+}
 
-local function base64Decode(s)
-    s = s:gsub('[^%w%+/=]', '')
-    local out, n = {}, 0
-    for i = 1, #s, 4 do
-        local a, b, c, d = s:byte(i, i + 3)
-        local A, B = B64_INDEX[a], a and b and B64_INDEX[b]
-        if not A or not B then break end
-        local C, D = c and B64_INDEX[c], d and B64_INDEX[d]
-        local v = A * 262144 + B * 4096 + (C or 0) * 64 + (D or 0)
-        n = n + 1; out[n] = string.char(math.floor(v / 65536) % 256)
-        if C then n = n + 1; out[n] = string.char(math.floor(v / 256) % 256) end
-        if D then n = n + 1; out[n] = string.char(v % 256) end
-    end
-    return table.concat(out)
+function access.ready()
+    return not CFG.gate:find('ВСТАВЬ', 1, true)
 end
 
--- Ответ API GitHub (JSON) -> содержимое файла, или nil.
--- Размер раскодированного файла сверяется с полем "size": так отсекается обрезанный ответ.
-local function decodeContentsJson(json)
-    if not json:find('"encoding"%s*:%s*"base64"') then return nil end
-    local b64 = json:match('"content"%s*:%s*"([^"]*)"')
-    if not b64 then return nil end
-    b64 = b64:gsub('\\n', ''):gsub('\\r', ''):gsub('\\/', '/')
-    local data = base64Decode(b64)
-    local size = tonumber(json:match('"size"%s*:%s*(%d+)'))
-    if size and #data ~= size then
-        dbg(string.format('ответ API неполный: %d из %d байт', #data, size))
-        return nil
-    end
-    return data ~= '' and data or nil
+function access.path()
+    return getWorkingDirectory() .. '\\config\\sf_access.txt'
 end
 
--- Свежий файл из репозитория: cb(содержимое или nil, 'api' | 'raw')
--- Откуда берётся файл: 1) API GitHub (свежий, но лимит 60 запросов в час на IP);
--- 2) прямая ссылка raw.githubusercontent.com (кэш до 5 минут, у некоторых провайдеров заблокирована);
--- 3) зеркало jsDelivr (cdn.jsdelivr.net) - открывается, когда GitHub недоступен, но может отставать на часы.
--- isValid(содержимое) - проверка, что пришёл нужный файл, а не страница ошибки или блокировки.
+function access.save()
+    local dir = getWorkingDirectory() .. '\\config'
+    if not doesDirectoryExist(dir) then createDirectory(dir) end
+    local f = io.open(access.path(), 'w')
+    if not f then return end
+    f:write('; AMARAYTHEN Capter: ключ доступа. Никому не передавай, он привязан к твоему нику.\n')
+    if access.token then f:write('token=' .. access.token .. '\n') end
+    if access.nick then f:write('nick=' .. access.nick .. '\n') end
+    if access.okAt then f:write('ok_at=' .. access.okAt .. '\n') end
+    if access.denied then f:write('denied=' .. access.denied .. '\n') end
+    f:close()
+end
+
+function access.load()
+    local f = io.open(access.path(), 'r')
+    if not f then return end
+    for line in f:lines() do
+        local k, v = line:match('^%s*([%w_]+)%s*=%s*(%S+)')
+        if k == 'token' and v:match('^%x+$') then access.token = v
+        elseif k == 'nick' then access.nick = v
+        elseif k == 'ok_at' then access.okAt = tonumber(v)
+        elseif k == 'denied' and access.DENIED[v] then access.denied = v
+        end
+    end
+    f:close()
+end
+
+hasAccess = function()
+    -- отказ сервера стирает okAt, так что и отказ, и «ни разу не проверен» здесь одно и то же
+    if not access.ready() or not access.token or not access.okAt then return false end
+    local me = myNick()
+    if me and access.nick and lower(me) ~= lower(access.nick) then return false end
+    return os.time() - access.okAt < CFG.access_grace
+end
+
+function access.help()
+    msg('{FF6060}Нет доступа. Capter только для участников нашей беседы в ВК или Telegram.')
+    msg('Напиши в личку ' .. CFG.gate_hint .. ', пришлют код. Потом набери /ac code <код>.')
+end
+
+-- Без доступа скрипт ничего не делает; говорю об этом и возвращаю false
+function access.need()
+    if hasAccess() then return true end
+    if not access.ready() then
+        msg('{FF6060}В этой сборке не указан сервер доступа, скрипт не работает. Скажи тому, кто её выпустил.')
+    else
+        if access.denied then msg('{FF6060}Доступ закрыт: ' .. access.DENIED[access.denied] .. '.') end
+        access.help()
+    end
+    return false
+end
+
+-- Адрес на сервере доступа; t - против кэша Windows, который иначе отдаёт прежний ответ
+function access.url(path, params)
+    local q = {}
+    for k, v in pairs(params) do
+        q[#q + 1] = k .. '=' .. tostring(v):gsub('[^%w%-_%.~]', function(c) return string.format('%%%02X', c:byte()) end)
+    end
+    q[#q + 1] = 't=' .. os.time()
+    return CFG.gate .. path .. '?' .. table.concat(q, '&')
+end
+
+-- Сервер прямо отказал. Неизвестный ключ больше не нужен, остальные ещё могут ожить
+-- (вернулся в беседу, зашёл своим ником).
+function access.deny(reason, verbose)
+    local was = hasAccess()
+    access.denied, access.okAt = reason, nil
+    if reason == 'token' then access.token, access.nick = nil, nil end
+    access.save()
+    if was or verbose then
+        msg('{FF6060}Доступ закрыт: ' .. access.DENIED[reason] .. '.')
+        access.help()
+    end
+end
+
+-- Проверка ключа на сервере. onDone(есть ли доступ) - когда ответ получен или не получен.
+function access.check(verbose, onDone)
+    local function done() if onDone then onDone(hasAccess()) end end
+    local me = myNick()
+    if not access.ready() or not access.token or not me or access.checking then
+        done()
+        return
+    end
+    access.checking, access.checkedAt = true, os.clock()
+    httpGet(access.url('/check', { nick = me, token = access.token }), 8000, function(answer)
+        access.checking = false
+        answer = answer and trim(answer)
+        local reason = answer and answer:match('^no:(%a+)$')
+        if answer == 'ok' then
+            local was = hasAccess()
+            access.okAt, access.denied, access.nick = os.time(), nil, me
+            access.save()
+            if verbose or not was then msg('Доступ подтверждён.') end
+        elseif reason and access.DENIED[reason] then
+            access.deny(reason, verbose)
+        elseif verbose then
+            msg(hasAccess() and 'Сервер доступа не ответил, работаю по прошлой проверке.'
+                or '{FF6060}Сервер доступа не ответил. Проверь интернет и набери /ac reload.')
+        end
+        done()
+    end)
+end
+
+-- /ac code <код>: код из бота меняется на ключ, привязанный к нику
+function access.bind(code)
+    if not access.ready() then
+        access.need()
+        return
+    end
+    local me = myNick()
+    if not me then
+        msg('Сначала зайди в игру персонажем, ключ привязывается к нику.')
+        return
+    end
+    code = (code or ''):upper():gsub('[^A-Z0-9]', '')
+    if #code ~= 8 then
+        msg('Код - 8 букв и цифр, его присылает бот. Набери: /ac code <код>')
+        return
+    end
+    msg('Проверяю код...')
+    httpGet(access.url('/bind', { nick = me, code = code }), 8000, function(answer)
+        answer = answer and trim(answer) or ''
+        local token = answer:match('^ok (%x+)$')
+        if token then
+            access.token, access.nick, access.okAt, access.denied = token, me, os.time(), nil
+            access.checkedAt = os.clock()   -- ключ только что выдан: перепроверять незачем
+            access.save()
+            msg('Доступ открыт для ' .. me .. '. Скачиваю общий список...')
+            loadRemoteRoster(true)
+        elseif answer == 'no:code' then
+            msg('{FF6060}Код не подошёл: неверный, уже использован или прошло больше 10 минут. Попроси у бота новый.')
+        elseif answer == 'no:bad' then
+            msg('{FF6060}Сервер не принял ник или код. Проверь, что код набран без ошибок.')
+        else
+            msg('{FF6060}Сервер доступа не ответил, попробуй через минуту.')
+        end
+    end)
+end
+
+-- Свежий файл из закрытого репозитория через сервер доступа: cb(содержимое или nil, 'gate').
+-- isValid(содержимое) - проверка, что пришёл нужный файл, а не ответ с ошибкой.
 local function fetchRepoFile(path, timeoutMs, cb, isValid)
-    local g, t = CFG.github, os.time()
-    local api = string.format('https://api.github.com/repos/%s/%s/contents/%s?ref=%s&t=%d',
-        g.owner, g.repo, path, g.branch, t)
-    local raw = string.format('https://raw.githubusercontent.com/%s/%s/%s/%s?nocache=%d',
-        g.owner, g.repo, g.branch, path, t)
-    local cdn = string.format('https://cdn.jsdelivr.net/gh/%s/%s@%s/%s',
-        g.owner, g.repo, g.branch, path)
-    local function good(content)
-        return content and (not isValid or isValid(content))
+    local me = myNick()
+    if not access.ready() or not access.token or not me then
+        cb(nil, 'gate')
+        return
     end
-    httpGet(api, timeoutMs, function(json)
-        local data = json and decodeContentsJson(json)
-        if good(data) then
-            cb(data, 'api')
+    httpGet(access.url('/file/' .. path, { nick = me, token = access.token }), timeoutMs, function(content)
+        local reason = content and content:match('^no:(%a+)%s*$')
+        if reason then
+            if access.DENIED[reason] then access.deny(reason) end
+            dbg('сервер доступа не отдал ' .. path .. ': ' .. reason)
+            cb(nil, 'gate')
             return
         end
-        dbg('API GitHub не ответил для ' .. path .. ', беру по прямой ссылке')
-        httpGet(raw, timeoutMs, function(content)
-            if good(content) then
-                cb(content, 'raw')
-                return
-            end
-            dbg('прямая ссылка GitHub не ответила для ' .. path .. ', беру с зеркала jsDelivr')
-            httpGet(cdn, timeoutMs, function(mirror)
-                if good(mirror) then cb(mirror, 'cdn') else cb(content or mirror, 'raw') end
-            end)
-        end)
+        cb((content and (not isValid or isValid(content))) and content or nil, 'gate')
     end)
 end
 
@@ -1326,7 +1452,7 @@ loadRemoteRoster = function(verbose, onDone, timeoutMs)
     rosterWaiters = { { verbose = verbose, onDone = onDone } }
     rosterCheckedAt = os.clock()
 
-    fetchRepoFile(CFG.roster_path, timeoutMs or 8000, function(content, source)
+    fetchRepoFile(CFG.roster_path, timeoutMs or 8000, function(content)
         local waiters = rosterWaiters
         rosterWaiters = nil
         local anyVerbose = false
@@ -1335,13 +1461,9 @@ loadRemoteRoster = function(verbose, onDone, timeoutMs)
         local ok, text = false, nil
         local ver, list, leaders
         if content then ver, list, leaders = parseRoster(content) end
-        -- зеркало может отставать: более старую версию списка, чем уже сохранённая, не берём
-        if source == 'cdn' and ver and ver < roster.version then
-            dbg(string.format('зеркало отдало старый список v%d, оставляю сохранённый v%d', ver, roster.version))
-            content, ver = nil, nil
-        end
         if not content then
-            text = '{FF6060}Общий список не скачался, оставлен сохранённый. Проверь интернет.'
+            text = hasAccess() and '{FF6060}Общий список не скачался, оставлен сохранённый. Проверь интернет.'
+                or '{FF6060}Общий список не скачался: нет доступа (/ac code <код>).'
         elseif not ver then
             text = '{FF6060}Общий список в неверном формате, оставлен сохранённый.'
         else
@@ -1352,7 +1474,6 @@ loadRemoteRoster = function(verbose, onDone, timeoutMs)
             roster.fetchedAt = os.clock()
             changed = changed or listHash() ~= oldHash
             saveRosterCache(content)
-            dbg('список получен через ' .. source)
             local info = string.format('v%d, %d ников, лидеров %d.', ver, #list, #leaderList())
             if anyVerbose then
                 text = 'Общий список загружен: ' .. info
@@ -1413,18 +1534,17 @@ local function checkForUpdate(verbose)
         if text then msg(text) end
     end
 
-    fetchRepoFile(CFG.script_path, 15000, function(content, source)
+    fetchRepoFile(CFG.script_path, 15000, function(content)
         if not content then
-            finish(verbose and '{FF6060}Не удалось проверить обновления: нет ответа от GitHub.' or nil)
+            finish(verbose and '{FF6060}Не удалось проверить обновления: нет ответа от сервера доступа.' or nil)
             return
         end
-        dbg('файл обновления получен через ' .. source)
 
         local newVersion = content:match("script_version%(%s*'([^']+)'%s*%)")
         local isOurs = content:find("script_name('AMARAYTHEN Capter')", 1, true)
             or content:find("script_name('SF Capture')", 1, true)
         if not newVersion or not isOurs then
-            finish(verbose and '{FF6060}Файл обновления на GitHub не похож на AMARAYTHEN Capter.' or nil)
+            finish(verbose and '{FF6060}Файл обновления не похож на AMARAYTHEN Capter.' or nil)
             return
         end
         if not isNewerVersion(newVersion, thisScript().version) then
@@ -1439,7 +1559,7 @@ local function checkForUpdate(verbose)
             return
         end
         if not content:find(UPDATE_MARKER, 1, true) then
-            finish('{FF6060}Обновление v' .. newVersion .. ' пропущено: файл на GitHub в неверной кодировке.')
+            finish('{FF6060}Обновление v' .. newVersion .. ' пропущено: файл в репозитории в неверной кодировке.')
             return
         end
         local chunk, err = (loadstring or load)(content)
@@ -1494,7 +1614,7 @@ local function finalizeAutoLaunch()
     end
     local nl = presentNicks(nil, p.since, 'nl')
     if #nl > 0 then
-        msgNicks(string.format('{FFB040}Не видят тебя лидером (нет списка с GitHub), в волне не будут (%d):{CFCFCF}', #nl), nl)
+        msgNicks(string.format('{FFB040}Не видят тебя лидером (нет свежего общего списка), в волне не будут (%d):{CFCFCF}', #nl), nl)
     end
     local silent = silentRosterNicks(nil, p.since)
     if #silent > 0 then
@@ -1504,6 +1624,7 @@ local function finalizeAutoLaunch()
 end
 
 local function leaderStart(delay, cd)
+    if not access.need() then return end
     delay = math.floor(delay)
     if delay < CFG.min_delay or delay > CFG.max_delay then
         msg(string.format('Задержка должна быть от %d до %d мс.', CFG.min_delay, CFG.max_delay))
@@ -1540,6 +1661,7 @@ end
 
 -- Отдельное сканирование (кнопка/команда или само при входе лидера в игру)
 local function leaderScan(onJoin)
+    if not access.need() then return end
     local nick = myNick() or ''
     if not isLeader(nick) then
         msg('Сканировать может только лидер.')
@@ -1561,6 +1683,7 @@ end
 
 -- Лидер просит всех сразу скачать свежий список
 local function leaderSync()
+    if not access.need() then return end
     local nick = myNick() or ''
     if not isLeader(nick) then
         msg('Обновить список у всех может только лидер. Обнови у себя: /ac reload.')
@@ -1591,7 +1714,13 @@ local function reloadAll()
         return false
     end
     loadConfig(true)
-    loadRemoteRoster(true)
+    if not access.token then
+        access.need()
+        return true
+    end
+    access.check(true, function(ok)
+        if ok then loadRemoteRoster(true) end
+    end)
     return true
 end
 
@@ -1647,6 +1776,7 @@ if hasImgui then
         notice    = nil,
         noticeErr = false,
         noticeAt  = 0,
+        code      = new.char[24](),   -- код доступа из бота
     }
 
     -- черновик меню = копия текущих настроек
@@ -2175,7 +2305,7 @@ if hasImgui then
             imgui.TextDisabled(u8(info))
             local listH = 296
             if #g.nl > 0 then
-                wrappedColored(C_ACCENT, '«не видит лидера» - у игрока не скачался список лидеров с GitHub, ' ..
+                wrappedColored(C_ACCENT, '«не видит лидера» - у игрока не скачался общий список лидеров, ' ..
                     'в волну он не попадёт. Пусть наберёт /ac reload.')
                 listH = listH - 40
             end
@@ -2271,11 +2401,11 @@ if hasImgui then
             h = h - 22
         elseif roster.fetchedAt then
             local m = math.floor((os.clock() - roster.fetchedAt) / 60)
-            imgui.TextDisabled(u8(m < 1 and 'список с GitHub обновлён только что'
-                or string.format('список с GitHub обновлён %d мин назад', m)))
+            imgui.TextDisabled(u8(m < 1 and 'общий список обновлён только что'
+                or string.format('общий список обновлён %d мин назад', m)))
             h = h - 22
         else
-            wrappedColored(C_ACCENT, 'GitHub у тебя сейчас не открывается: видны только встроенные лидеры ' ..
+            wrappedColored(C_ACCENT, 'Сервер доступа у тебя сейчас не отвечает: видны только встроенные лидеры ' ..
                 'и сохранённая копия списка. Проверь интернет или попробуй VPN, потом /ac reload.')
             h = h - 62
         end
@@ -2299,7 +2429,7 @@ if hasImgui then
 
         sectionTitle('УЧАСТНИКИ')
         if imgui.Checkbox(u8'Автоопределение (кто со скриптом, тот в волне)', ui.autoDisc) then ui.dirty = true end
-        imgui.TextDisabled(u8'Выкл - участники из списка состава на GitHub.')
+        imgui.TextDisabled(u8'Выкл - участники из общего списка состава.')
 
         sectionTitle('ПОВЕДЕНИЕ')
         if imgui.Checkbox(u8'Поправка на пинг (рекомендуется)', ui.ping) then ui.dirty = true end
@@ -2319,6 +2449,35 @@ if hasImgui then
             uiDo('перечитать конфиг', function()
                 if reloadAll() then setNotice('Конфиг перечитан.') end
             end)
+        end
+    end
+
+    -- Без доступа вместо вкладок - как его получить и поле для кода
+    local function drawAccessTab()
+        sectionTitle('ДОСТУП')
+        wrappedColored(C_TEXT, 'Capter работает только у участников нашей беседы в ВК или Telegram.')
+        imgui.Dummy(V2(0, 2))
+        mutedWrapped('1. Напиши в личку: ' .. CFG.gate_hint .. '.')
+        mutedWrapped('2. Бот проверит, что ты в беседе, и пришлёт код.')
+        mutedWrapped('3. Впиши код сюда. Ключ привяжется к нику ' .. (myNick() or '(зайди в игру)') .. '.')
+        if access.denied then
+            imgui.Dummy(V2(0, 2))
+            wrappedColored(C_RED, 'Сервер закрыл доступ: ' .. access.DENIED[access.denied] .. '.')
+        end
+        imgui.Dummy(V2(0, 6))
+        imgui.PushItemWidth(contentWidth())
+        imgui.InputText('##accesscode', ui.code, ffi.sizeof(ui.code))
+        imgui.PopItemWidth()
+        if colorButton(u8'Открыть доступ', contentWidth(), 34, C_ACCENT, C_ACCENT_HI, C_ON_ACCENT) then
+            local code = ffi.string(ui.code)
+            setNotice('Проверяю код...')
+            uiDo('ввод кода', function() access.bind(code) end)
+        end
+        if access.token then
+            imgui.Dummy(V2(0, 2))
+            if imgui.Button(u8'Проверить ключ ещё раз', V2(contentWidth(), 30)) then
+                uiDo('проверка ключа', function() access.check(true) end)
+            end
         end
     end
 
@@ -2437,16 +2596,21 @@ if hasImgui then
                 mark('ореол')
                 drawHeader()
                 mark('шапка')
-                drawTabs()
-                mark('вкладки, открыта ' .. ui.tab)
-                if ui.tab == 1 then
-                    drawLaunchTab()
-                elseif ui.tab == 2 then
-                    drawRosterTab()
-                elseif ui.tab == 3 then
-                    drawLeadersTab()
+                if not hasAccess() then
+                    drawAccessTab()
+                    mark('доступ')
                 else
-                    drawSettingsTab()
+                    drawTabs()
+                    mark('вкладки, открыта ' .. ui.tab)
+                    if ui.tab == 1 then
+                        drawLaunchTab()
+                    elseif ui.tab == 2 then
+                        drawRosterTab()
+                    elseif ui.tab == 3 then
+                        drawLeadersTab()
+                    else
+                        drawSettingsTab()
+                    end
                 end
                 mark('вкладка нарисована')
                 drawFooter()
@@ -2464,7 +2628,7 @@ local function menuOpen()
 end
 
 -- ----------------------------- команды -----------------------------
-local HELP = '/ac - меню. Ещё: /ac start <мс> [отсчёт], stop, scan, sync, status, list, reload, update'
+local HELP = '/ac - меню. Ещё: /ac code <код>, start <мс> [отсчёт], stop, scan, sync, status, list, reload, update'
 
 local function cmdSf(arg)
     local cmd, a1, a2 = (arg or ''):match('^%s*(%S*)%s*(%S*)%s*(%S*)')
@@ -2482,6 +2646,9 @@ local function cmdSf(arg)
             msg('Меню недоступно: не установлена библиотека mimgui. Команды работают.')
             msg(HELP)
         end
+
+    elseif cmd == 'code' then
+        access.bind((arg or ''):match('^%s*%S+%s*(.-)%s*$'))
 
     elseif cmd == 'start' then
         local delay = tonumber(a1)
@@ -2504,12 +2671,14 @@ local function cmdSf(arg)
             me ~= '' and me or '?', isLeader(me) and ' (лидер)' or '',
             roster.version, active, #roster.list, slot and tostring(slot + 1) or 'нет',
             PHASE_NAME[state.phase]))
+        msg(hasAccess() and ('Доступ: есть, ключ на ' .. access.nick .. '.') or 'Доступ: нет (/ac code <код>).')
         if state.phase ~= 'idle' then
             msg(string.format('Лидер %s, задержка %d мс, слот %d/%d, отправлено %d.',
                 state.leader, state.delay, state.slot + 1, state.active, state.sent))
         end
 
     elseif cmd == 'list' then
+        if not access.need() then return end
         local leaders = leaderList()
         msg('Лидеры: ' .. (#leaders > 0 and table.concat(leaders, ', ') or 'нет'))
         msg(string.format('Список v%d (%d):', roster.version, #roster.list))
@@ -2535,6 +2704,7 @@ local function cmdSf(arg)
         reloadAll()
 
     elseif cmd == 'update' then
+        if not access.need() then return end
         msg('Проверяю обновления... (текущая версия v' .. thisScript().version .. ')')
         checkForUpdate(true)
 
@@ -2615,13 +2785,13 @@ function main()
     sampRegisterChatCommand('ac', cmdSf)
     loadConfig(false)
     loadKnown()
+    access.load()
     if roster.version > 0 then
-        msg(string.format('v%s загружен. Общий список v%d (%d ников, лидеров %d), проверяю обновления...',
+        msg(string.format('v%s загружен. Общий список v%d (%d ников, лидеров %d).',
             thisScript().version, roster.version, #roster.list, #leaderList()))
     else
-        msg(string.format('v%s загружен, скачиваю общий список...', thisScript().version))
+        msg(string.format('v%s загружен.', thisScript().version))
     end
-    loadRemoteRoster(true)
     if hasImgui then
         msg(HELP)
     else
@@ -2631,12 +2801,28 @@ function main()
 
     local lastLeaderCheck = 0
     local announceAt, announced = nil, false
+    local accessStarted = false
     while true do
         wait(0)
         local now = os.clock()
 
         processOutbox(now)
         pollDownloads(now)
+
+        -- ключ проверяется, когда известен ник (персонаж в игре); с доступом - сразу свежий список
+        if not accessStarted and localReady() and myNick() then
+            accessStarted = true
+            if access.token and access.ready() then
+                access.check(false, function(ok)
+                    if ok then loadRemoteRoster(true) else access.need() end
+                end)
+            else
+                access.need()
+            end
+        elseif accessStarted and access.token and not access.checking and state.phase == 'idle'
+            and now - access.checkedAt > CFG.access_recheck then
+            access.check(false)
+        end
 
         -- действия, нажатые в меню: выполняются здесь, а не во время отрисовки окна
         if #uiActions > 0 then
@@ -2654,7 +2840,7 @@ function main()
 
         -- при входе в игру (один раз за запуск скрипта): участник отмечается в чате,
         -- лидер сканирует - так игроки со скриптом сами появляются в списке у лидеров
-        if not announced and CFG.auto_discovery and CFG.announce_on_join and localReady() and myNick() then
+        if not announced and CFG.auto_discovery and CFG.announce_on_join and localReady() and myNick() and hasAccess() then
             if not announceAt then
                 local a, b = CFG.announce_delay[1], CFG.announce_delay[2]
                 announceAt = now + a + math.random() * (b - a)
@@ -2669,8 +2855,8 @@ function main()
             finalizeAutoLaunch()
         end
 
-        -- автообновление: только когда нет флуда и лидер ничего не ждёт из чата
-        if state.phase == 'idle' and not outbox and not pendingGo then
+        -- автообновление: только с доступом, когда нет флуда и лидер ничего не ждёт из чата
+        if accessStarted and state.phase == 'idle' and not outbox and not pendingGo and hasAccess() then
             if update.pending then
                 local p = update.pending
                 update.pending = nil
@@ -2682,7 +2868,7 @@ function main()
         end
 
         -- общий ростер перепроверяется сам, пока нет флуда
-        if state.phase == 'idle' and not rosterBusy()
+        if accessStarted and state.phase == 'idle' and not rosterBusy() and hasAccess()
             and now - rosterCheckedAt > CFG.roster_refresh then
             loadRemoteRoster(false)
         end
