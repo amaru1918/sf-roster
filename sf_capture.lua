@@ -1,6 +1,6 @@
 script_name('AMARAYTHEN Capter')
 script_author('amaru')
-script_version('3.2')
+script_version('3.3')
 script_description('AMARAYTHEN Capter by amaru: синхронный флуд /capture волной. Запуск лидером через /fc.')
 -- Совместимость с автообновлением v1.8-v1.9, которые ищут в новом файле прежнее имя.
 -- Не удалять: script_name('SF Capture')
@@ -39,6 +39,11 @@ local CFG = {
     -- Сервер доступа (capter-gate): проверяет, что игрок в беседе, и раздаёт файлы по ключу.
     gate            = 'https://capter-gate.ultrasonline.workers.dev',
     gate_hint       = 'Telegram @script_amaraythen_bot или ВК vk.com/club175987243',   -- куда писать за кодом
+    -- Кнопки во вкладке доступа: открывают личку бота в браузере или в приложении Telegram / ВК
+    gate_links      = {
+        { 'Telegram-бот', 'https://t.me/script_amaraythen_bot' },
+        { 'Бот ВКонтакте', 'https://vk.me/club175987243' },
+    },
     access_recheck  = 1800,       -- как часто перепроверять ключ, с
     access_grace    = 86400,      -- сколько скрипт работает без связи с сервером после последней удачной проверки, с
     sync_cooldown   = 5,          -- не чаще раза в N секунд выполнять «обновить у всех»
@@ -1337,6 +1342,25 @@ function access.url(path, params)
     return CFG.gate .. path .. '?' .. table.concat(q, '&')
 end
 
+-- Ссылка из меню: открывается тем, что в Windows открывает ссылки (браузер, а t.me и vk.me
+-- дальше сами предлагают приложение). Только из меню, а меню есть только с mimgui - значит, есть ffi.
+function access.open(url)
+    local ok, res = pcall(function()
+        if not access.shell32 then
+            pcall(ffi.cdef, 'void* __stdcall ShellExecuteA(void*, const char*, const char*, const char*, const char*, int);')
+            access.shell32 = ffi.load('shell32')
+        end
+        -- больше 32 - открылось, иначе код ошибки Windows
+        return tonumber(ffi.cast('intptr_t', access.shell32.ShellExecuteA(nil, 'open', url, nil, nil, 1)))
+    end)
+    if ok and res and res > 32 then
+        msg('Открываю ' .. url .. ' ...')
+    else
+        trace('ссылка не открылась: ' .. tostring(res))
+        msg('{FF6060}Не получилось открыть ссылку, открой сам: ' .. url)
+    end
+end
+
 -- Сервер прямо отказал. Неизвестный ключ больше не нужен, остальные ещё могут ожить
 -- (вернулся в беседу, зашёл своим ником).
 function access.deny(reason, verbose)
@@ -2457,7 +2481,17 @@ if hasImgui then
         sectionTitle('ДОСТУП')
         wrappedColored(C_TEXT, 'Capter работает только у участников нашей беседы в ВК или Telegram.')
         imgui.Dummy(V2(0, 2))
-        mutedWrapped('1. Напиши в личку: ' .. CFG.gate_hint .. '.')
+        mutedWrapped('1. Напиши боту в личку «код». Кнопка откроет чат с ботом:')
+        local links = CFG.gate_links
+        local lw = (contentWidth() - 8 * (#links - 1)) / #links
+        for i, link in ipairs(links) do
+            if i > 1 then imgui.SameLine(0, 8) end
+            if imgui.Button(u8(link[1]), V2(lw, 30)) then
+                local url = link[2]
+                uiDo('ссылка ' .. link[1], function() access.open(url) end)
+            end
+        end
+        mutedWrapped('Не открылось - найди сам: ' .. CFG.gate_hint .. '.')
         mutedWrapped('2. Бот проверит, что ты в беседе, и пришлёт код.')
         mutedWrapped('3. Впиши код сюда. Ключ привяжется к нику ' .. (myNick() or '(зайди в игру)') .. '.')
         if access.denied then
