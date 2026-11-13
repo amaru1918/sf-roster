@@ -3,6 +3,7 @@
 Escay_Eastwood
 Karl_Branting
 Amaru_Noster
+Satanic_Fujiwara
 [roster]
 Escay_Eastwood
 Amaru_Noster
@@ -17,3 +18,4 @@ Karl_Voeval
 Oazis_Booms
 Sakhalin_Dizzante
 Schow_Monteiro
+Satanic_Fujiwara
